@@ -1,0 +1,27 @@
+.DS_Store
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+*.egg-info/
+*.py[cod]
+build/
+dist/
+
+# Local environments
+.env
+.python-version
+venv/
+
+# Replay datasets and generated artifacts
+data/raw/
+data/interim/
+data/processed/
+artifacts/
+cache/
+logs/
+*.db
+*.sqlite
+*.sqlite3

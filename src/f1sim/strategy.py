@@ -1,0 +1,718 @@
+"""Rollout-based strategy search for replay-first recommendations."""
+
+from __future__ import annotations
+
+import math
+import random
+from dataclasses import asdict, dataclass, replace
+from statistics import median
+from typing import Any
+
+from f1sim.assumptions import default_assumptions_hash
+from f1sim.contracts import (
+    Plan,
+    PlanComparison,
+    PlanMetrics,
+    RecommendationBundle,
+    Scenario,
+)
+from f1sim.eval.metrics import quantile
+from f1sim.explainer import build_plan_counterfactuals, build_plan_explanations
+from f1sim.features import FEATURE_SCHEMA_VERSION
+from f1sim.models import (
+    DegradationModelV0,
+    PaceModelV0,
+    PitPolicyModelV0,
+    PitPolicyModelV0Config,
+    ScenarioModelV0,
+)
+from f1sim.rules import action_mask, plan_satisfies_rules
+from f1sim.state import CarState, RaceState, TrackStatus, TyreCompound
+
+DEFAULT_RULE_THRESHOLDS = {
+    TyreCompound.SOFT.value: 14,
+    TyreCompound.MEDIUM.value: 20,
+    TyreCompound.HARD.value: 28,
+    TyreCompound.INTER.value: 10,
+    TyreCompound.WET.value: 10,
+    TyreCompound.UNKNOWN.value: 18,
+}
+
+SEARCH_MODEL_VERSION = "rollout_search_v0.3"
+
+
+@dataclass(slots=True)
+class ModelSuite:
+    degradation_model: DegradationModelV0
+    pace_model: PaceModelV0
+    pit_policy_model: PitPolicyModelV0
+    scenario_model: ScenarioModelV0
+
+    def model_versions(self) -> dict[str, str]:
+        return {
+            "pace": self.pace_model.model_version,
+            "degradation": self.degradation_model.model_version,
+            "pit_policy": self.pit_policy_model.model_version,
+            "scenario": self.scenario_model.model_version,
+            "search": SEARCH_MODEL_VERSION,
+        }
+
+
+@dataclass(slots=True)
+class RolloutSearchConfig:
+    horizon_laps: int = 8
+    n_scenarios: int = 16
+    copy_policy: str = "nearest"
+    top_k: int = 3
+    two_dry_deadline_laps: int = 12
+    rule_thresholds: dict[str, int] | None = None
+
+    def resolved_thresholds(self) -> dict[str, int]:
+        thresholds = dict(DEFAULT_RULE_THRESHOLDS)
+        if self.rule_thresholds is not None:
+            thresholds.update(self.rule_thresholds)
+        return thresholds
+
+
+@dataclass(slots=True)
+class SimulationOutcome:
+    total_time_ms: float
+    final_position: int
+
+
+def build_model_suite(rule_thresholds: dict[str, int] | None = None) -> ModelSuite:
+    thresholds = dict(DEFAULT_RULE_THRESHOLDS)
+    if rule_thresholds is not None:
+        thresholds.update(rule_thresholds)
+    degradation_model = DegradationModelV0()
+    pace_model = PaceModelV0(degradation_model=degradation_model)
+    pit_policy_model = PitPolicyModelV0(
+        config=PitPolicyModelV0Config(compound_thresholds=dict(thresholds))
+    )
+    scenario_model = ScenarioModelV0()
+    return ModelSuite(
+        degradation_model=degradation_model,
+        pace_model=pace_model,
+        pit_policy_model=pit_policy_model,
+        scenario_model=scenario_model,
+    )
+
+
+class RolloutStrategySearcher:
+    """Evaluate a small action set with deterministic rollout simulation."""
+
+    model_name = "rollout_search_v0"
+    model_version = SEARCH_MODEL_VERSION
+    trained_on = "heuristic"
+    feature_schema_version = FEATURE_SCHEMA_VERSION
+
+    def __init__(
+        self,
+        *,
+        suite: ModelSuite | None = None,
+        config: RolloutSearchConfig | None = None,
+    ) -> None:
+        self.config = config or RolloutSearchConfig()
+        self.suite = suite or build_model_suite(self.config.rule_thresholds)
+
+    def recommend(
+        self,
+        state: RaceState,
+        target_driver: str,
+        *,
+        horizon_laps: int,
+        top_k: int,
+        seed: int,
+    ) -> RecommendationBundle:
+        bundle, _ = self._recommend_internal(
+            state=state,
+            target_driver=target_driver,
+            horizon_laps=horizon_laps,
+            top_k=top_k,
+            seed=seed,
+        )
+        return bundle
+
+    def recommend_with_artifacts(
+        self,
+        state: RaceState,
+        target_driver: str,
+        *,
+        horizon_laps: int | None = None,
+        top_k: int | None = None,
+        seed: int = 7,
+    ) -> tuple[RecommendationBundle, dict[str, Plan]]:
+        return self._recommend_internal(
+            state=state,
+            target_driver=target_driver,
+            horizon_laps=horizon_laps or self.config.horizon_laps,
+            top_k=top_k or self.config.top_k,
+            seed=seed,
+        )
+
+    def _recommend_internal(
+        self,
+        *,
+        state: RaceState,
+        target_driver: str,
+        horizon_laps: int,
+        top_k: int,
+        seed: int,
+    ) -> tuple[RecommendationBundle, dict[str, Plan]]:
+        if target_driver not in state.cars:
+            raise ValueError(f"target driver not present in state: {target_driver}")
+
+        thresholds = self.config.resolved_thresholds()
+        race_total_laps = _race_total_laps(state=state, fallback_horizon=horizon_laps)
+        rule_mask = action_mask(
+            state,
+            target_driver,
+            state.lap,
+            race_total_laps,
+            deadline_laps=self.config.two_dry_deadline_laps,
+        )
+        scenarios = self.suite.scenario_model.sample_scenarios(
+            state,
+            horizon_laps=horizon_laps,
+            n=self.config.n_scenarios,
+            seed=seed,
+        )
+        candidate_actions = self._candidate_actions(state)
+        stay_out_outcomes = self._simulate_plan(
+            state=state,
+            target_driver=target_driver,
+            action="STAY_OUT",
+            scenarios=scenarios,
+            seed=seed,
+        )
+
+        action_outcomes: dict[str, list[SimulationOutcome]] = {"STAY_OUT": stay_out_outcomes}
+        for action in candidate_actions:
+            if action == "STAY_OUT":
+                continue
+            action_outcomes[action] = self._simulate_plan(
+                state=state,
+                target_driver=target_driver,
+                action=action,
+                scenarios=scenarios,
+                seed=seed,
+            )
+
+        plans = {
+            action: self._plan_from_outcomes(
+                state=state,
+                target_driver=target_driver,
+                plan_id=action,
+                action=action,
+                outcomes=outcomes,
+                baseline_outcomes=stay_out_outcomes,
+            )
+            for action, outcomes in action_outcomes.items()
+        }
+        for plan in plans.values():
+            plan.explanations = build_plan_explanations(
+                state=state,
+                target_driver=target_driver,
+                plan=plan,
+                plans_by_id=plans,
+                degradation_model=self.suite.degradation_model,
+                pit_policy_model=self.suite.pit_policy_model,
+                n_scenarios=self.config.n_scenarios,
+                race_total_laps=race_total_laps,
+                deadline_laps=self.config.two_dry_deadline_laps,
+            )
+            plan.counterfactuals = build_plan_counterfactuals(plan=plan, plans_by_id=plans)
+        feasible_plan_ids = [
+            action
+            for action in candidate_actions
+            if rule_mask.get(action, True)
+            and plan_satisfies_rules(state, target_driver, plans[action], race_total_laps)
+        ]
+        ranked = sorted(
+            (plans[action] for action in feasible_plan_ids),
+            key=lambda plan: (plan.metrics.delta_time_mean_ms, -plan.metrics.risk_sigma_ms),
+            reverse=True,
+        )
+
+        if top_k > len(ranked):
+            warnings = [f"requested top_k={top_k} but only {len(ranked)} feasible plans available"]
+            selected = ranked
+        else:
+            warnings = []
+            selected = ranked[:top_k]
+
+        baseline_plans = {
+            "STAY_OUT": plans["STAY_OUT"],
+            "RULE_TYRE_AGE": plans[self._rule_tyre_age_action(state, target_driver, thresholds)],
+            f"COPY_{self.config.copy_policy.upper()}": plans[
+                self._copy_action(state, target_driver, self.config.copy_policy)
+            ],
+        }
+        best_plan = selected[0]
+        baselines = {
+            name: _plan_comparison(best_plan, baseline_plan)
+            for name, baseline_plan in baseline_plans.items()
+        }
+        bundle = RecommendationBundle(
+            session_id=state.session_id,
+            lap=state.lap,
+            target_driver=target_driver,
+            generated_at_ts=f"replay:{state.session_id}:lap:{state.lap}:seed:{seed}",
+            top_k=selected,
+            baselines=baselines,
+            assumptions_hash=default_assumptions_hash(),
+            model_versions=self.suite.model_versions(),
+            warnings=warnings,
+        )
+        return bundle, baseline_plans
+
+    def _candidate_actions(self, state: RaceState) -> list[str]:
+        actions = [
+            "STAY_OUT",
+            "PIT_TO_SOFT",
+            "PIT_TO_MEDIUM",
+            "PIT_TO_HARD",
+        ]
+        rainfall = state.weather.get("rainfall")
+        wet_context = (
+            rainfall is not None and rainfall > 0.0
+        ) or any(
+            car.tyre_compound in {TyreCompound.INTER, TyreCompound.WET}
+            for car in state.cars.values()
+        )
+        if wet_context:
+            actions.extend(["PIT_TO_INTER", "PIT_TO_WET"])
+        return actions
+
+    def _simulate_plan(
+        self,
+        *,
+        state: RaceState,
+        target_driver: str,
+        action: str,
+        scenarios: list[Scenario],
+        seed: int,
+    ) -> list[SimulationOutcome]:
+        outcomes: list[SimulationOutcome] = []
+        for scenario_index, scenario in enumerate(scenarios):
+            rng = random.Random(seed + scenario_index * 10007 + sum(map(ord, target_driver)))
+            sim_state = _clone_state(state)
+            cumulative_times = {
+                driver_id: float(car.gap_to_leader_ms or 0.0)
+                for driver_id, car in sim_state.cars.items()
+            }
+            has_pitted = {driver_id: False for driver_id in sim_state.cars}
+            pace_cache: dict[tuple[Any, ...], Any] = {}
+            pit_cache: dict[tuple[Any, ...], Any] = {}
+
+            for step, status_name in enumerate(scenario.track_status_path, start=1):
+                sim_state.lap = state.lap + step - 1
+                sim_state.track_status = _track_status_from_name(status_name)
+                sim_state.weather = dict(scenario.weather_path[step - 1])
+
+                planned_actions: dict[str, str] = {}
+                for driver_id, _car in sim_state.cars.items():
+                    if driver_id == target_driver:
+                        planned_actions[driver_id] = action if step == 1 else "STAY_OUT"
+                        continue
+                    if has_pitted[driver_id]:
+                        planned_actions[driver_id] = "STAY_OUT"
+                        continue
+                    planned_actions[driver_id] = self._sample_opponent_action(
+                        state=sim_state,
+                        driver_id=driver_id,
+                        race_total_laps=_race_total_laps(
+                            state=state,
+                            fallback_horizon=len(scenario.track_status_path),
+                        ),
+                        pit_cache=pit_cache,
+                        rng=rng,
+                    )
+                    if planned_actions[driver_id] != "STAY_OUT":
+                        has_pitted[driver_id] = True
+
+                lap_times: dict[str, float] = {}
+                for driver_id, current_action in planned_actions.items():
+                    lap_times[driver_id] = self._simulate_driver_lap(
+                        sim_state=sim_state,
+                        driver_id=driver_id,
+                        action=current_action,
+                        pace_cache=pace_cache,
+                    )
+                    cumulative_times[driver_id] += lap_times[driver_id]
+                    if current_action != "STAY_OUT" and driver_id == target_driver:
+                        has_pitted[driver_id] = True
+
+                self._update_running_order(sim_state, cumulative_times, lap_times)
+
+            outcomes.append(
+                SimulationOutcome(
+                    total_time_ms=cumulative_times[target_driver],
+                    final_position=sim_state.cars[target_driver].position,
+                )
+            )
+        return outcomes
+
+    def _sample_opponent_action(
+        self,
+        *,
+        state: RaceState,
+        driver_id: str,
+        race_total_laps: int,
+        pit_cache: dict[tuple[Any, ...], Any],
+        rng: random.Random,
+    ) -> str:
+        rule_mask = action_mask(
+            state,
+            driver_id,
+            state.lap,
+            race_total_laps,
+            deadline_laps=self.config.two_dry_deadline_laps,
+        )
+        key = _pit_cache_key(state, driver_id)
+        if key not in pit_cache:
+            pit_cache[key] = self.suite.pit_policy_model.predict_pit_prob(
+                state,
+                driver_id,
+                window_laps=1,
+            )
+        prediction = pit_cache[key]
+        if rng.random() >= prediction.p_pit_in_window:
+            if rule_mask.get("STAY_OUT", True):
+                return "STAY_OUT"
+            return _first_feasible_action(rule_mask)
+        sampled_action = _compound_distribution_to_action(prediction.p_compound)
+        if rule_mask.get(sampled_action, True):
+            return sampled_action
+        if rule_mask.get("STAY_OUT", True):
+            return "STAY_OUT"
+        return _first_feasible_action(rule_mask)
+
+    def _simulate_driver_lap(
+        self,
+        *,
+        sim_state: RaceState,
+        driver_id: str,
+        action: str,
+        pace_cache: dict[tuple[Any, ...], Any],
+    ) -> float:
+        car = sim_state.cars[driver_id]
+        pit_penalty = 0.0
+        is_outlap = False
+        if action != "STAY_OUT":
+            car.tyre_compound = _tyre_compound_from_action(action)
+            car.tyre_age_laps = 0
+            car.stint_id += 1
+            _record_compound_usage(car)
+            pit_penalty = _pit_loss_ms(sim_state.track_status) + 2500.0
+            is_outlap = True
+        else:
+            car.tyre_age_laps += 1
+
+        car.pit_out = is_outlap
+        car.pit_in = action != "STAY_OUT"
+        car.is_pitting = action != "STAY_OUT"
+        car.cleaning_flags = replace(
+            car.cleaning_flags,
+            is_inlap=action != "STAY_OUT",
+            is_outlap=is_outlap,
+            is_sc_vsc=sim_state.track_status in {TrackStatus.SC, TrackStatus.VSC},
+        )
+        cache_key = _pace_cache_key(sim_state, driver_id)
+        if cache_key not in pace_cache:
+            pace_cache[cache_key] = self.suite.pace_model.predict_lap_time(sim_state, driver_id)
+        prediction = pace_cache[cache_key]
+        lap_time = pit_penalty + prediction.mean_ms
+        car.last_lap_time_ms = prediction.mean_ms
+        if not car.cleaning_flags.is_sc_vsc and not car.cleaning_flags.is_outlap:
+            recent = list(car.recent_lap_times_ms)
+            recent.append(prediction.mean_ms)
+            car.recent_lap_times_ms = recent[-5:]
+        return lap_time
+
+    def _update_running_order(
+        self,
+        sim_state: RaceState,
+        cumulative_times: dict[str, float],
+        lap_times: dict[str, float],
+    ) -> None:
+        ordered = sorted(cumulative_times.items(), key=lambda item: (item[1], item[0]))
+        leader_time = ordered[0][1]
+        previous_time: float | None = None
+        for position, (driver_id, total_time) in enumerate(ordered, start=1):
+            car = sim_state.cars[driver_id]
+            car.position = position
+            car.gap_to_leader_ms = total_time - leader_time
+            car.interval_ahead_ms = 0.0 if previous_time is None else total_time - previous_time
+            previous_time = total_time
+            car.interval_behind_ms = None
+            car.last_lap_time_ms = lap_times[driver_id]
+            car.is_pitting = False
+            car.pit_in = False
+
+        for idx, (driver_id, total_time) in enumerate(ordered[:-1]):
+            next_time = ordered[idx + 1][1]
+            sim_state.cars[driver_id].interval_behind_ms = next_time - total_time
+
+    def _plan_from_outcomes(
+        self,
+        *,
+        state: RaceState,
+        target_driver: str,
+        plan_id: str,
+        action: str,
+        outcomes: list[SimulationOutcome],
+        baseline_outcomes: list[SimulationOutcome],
+    ) -> Plan:
+        deltas = [
+            baseline.total_time_ms - outcome.total_time_ms
+            for baseline, outcome in zip(baseline_outcomes, outcomes, strict=True)
+        ]
+        initial_position = state.cars[target_driver].position
+        p_gain = sum(
+            1 for outcome in outcomes if outcome.final_position <= initial_position - 1
+        ) / len(outcomes)
+        mean_delta = sum(deltas) / len(deltas)
+        sigma = _distribution_sigma(deltas)
+        return Plan(
+            plan_id=plan_id,
+            actions=_plan_actions(state.lap, action),
+            metrics=PlanMetrics(
+                delta_time_mean_ms=mean_delta,
+                delta_time_p10_ms=quantile(deltas, 0.10) or mean_delta,
+                delta_time_p50_ms=quantile(deltas, 0.50) or mean_delta,
+                delta_time_p90_ms=quantile(deltas, 0.90) or mean_delta,
+                p_gain_pos_ge_1=p_gain,
+                risk_sigma_ms=sigma,
+            ),
+            explanations=[],
+            counterfactuals={},
+        )
+
+    @staticmethod
+    def _rule_tyre_age_action(
+        state: RaceState,
+        target_driver: str,
+        thresholds: dict[str, int],
+    ) -> str:
+        car = state.cars[target_driver]
+        threshold = thresholds.get(car.tyre_compound.value, thresholds[TyreCompound.UNKNOWN.value])
+        if car.tyre_age_laps >= threshold:
+            return _pit_action_for_compound(car.tyre_compound)
+        return "STAY_OUT"
+
+    @staticmethod
+    def _copy_action(state: RaceState, target_driver: str, copy_policy: str) -> str:
+        reference = _reference_car(
+            state=state,
+            target_driver=target_driver,
+            copy_policy=copy_policy,
+        )
+        if reference is None:
+            return "STAY_OUT"
+        if reference.pit_in or reference.pit_out:
+            return _pit_action_for_compound(state.cars[target_driver].tyre_compound)
+        return "STAY_OUT"
+
+
+def validate_recommendation_bundle(
+    bundle: RecommendationBundle,
+    *,
+    expected_top_k: int | None = None,
+) -> None:
+    if expected_top_k is not None and len(bundle.top_k) != expected_top_k and not bundle.warnings:
+        raise ValueError("bundle top_k length does not match expectation")
+    if not bundle.top_k:
+        raise ValueError("bundle top_k must not be empty")
+    for plan in bundle.top_k:
+        if len(plan.explanations) < 2 and bundle.top_k[0].metrics.risk_sigma_ms >= 0:
+            raise ValueError(f"plan {plan.plan_id} does not meet minimum explanation count")
+        if plan.metrics.delta_time_p10_ms > plan.metrics.delta_time_p90_ms:
+            raise ValueError(f"plan {plan.plan_id} has invalid quantiles")
+
+
+def recommendation_bundle_to_dict(bundle: RecommendationBundle) -> dict[str, Any]:
+    return {
+        "session_id": bundle.session_id,
+        "lap": bundle.lap,
+        "target_driver": bundle.target_driver,
+        "generated_at_ts": bundle.generated_at_ts,
+        "top_k": [_plan_to_dict(plan) for plan in bundle.top_k],
+        "baselines": {
+            name: {
+                "baseline_plan_id": comparison.baseline_plan_id,
+                "delta_time_mean_ms": comparison.delta_time_mean_ms,
+                "notes": comparison.notes,
+            }
+            for name, comparison in bundle.baselines.items()
+        },
+        "ground_truth": dict(bundle.ground_truth),
+        "assumptions_hash": bundle.assumptions_hash,
+        "model_versions": dict(bundle.model_versions),
+        "warnings": list(bundle.warnings),
+    }
+
+
+def _plan_to_dict(plan: Plan) -> dict[str, Any]:
+    return {
+        "plan_id": plan.plan_id,
+        "actions": list(plan.actions),
+        "metrics": asdict(plan.metrics),
+        "explanations": [asdict(explanation) for explanation in plan.explanations],
+        "counterfactuals": dict(plan.counterfactuals),
+    }
+
+
+def _clone_state(state: RaceState) -> RaceState:
+    return RaceState(
+        session_id=state.session_id,
+        lap=state.lap,
+        track_status=state.track_status,
+        total_laps=state.total_laps,
+        weather=dict(state.weather),
+        cars={
+            driver_id: replace(
+                car,
+                recent_lap_times_ms=list(car.recent_lap_times_ms),
+                used_dry_compounds=set(car.used_dry_compounds),
+                cleaning_flags=replace(car.cleaning_flags),
+            )
+            for driver_id, car in state.cars.items()
+        },
+        warnings=list(state.warnings),
+    )
+
+
+def _pace_cache_key(state: RaceState, driver_id: str) -> tuple[Any, ...]:
+    car = state.cars[driver_id]
+    recent_anchor = (
+        median(car.recent_lap_times_ms)
+        if car.recent_lap_times_ms
+        else car.last_lap_time_ms
+    )
+    rainfall = state.weather.get("rainfall")
+    track_c = state.weather.get("track_c")
+    return (
+        driver_id,
+        state.track_status.value,
+        car.tyre_compound.value,
+        car.tyre_age_laps,
+        round(car.gap_to_leader_ms or 0.0, 1),
+        round(car.interval_ahead_ms or 0.0, 1),
+        round(car.interval_behind_ms or 0.0, 1),
+        round(recent_anchor or 0.0, 1),
+        round(rainfall or 0.0, 3),
+        round(track_c or 0.0, 1),
+        car.cleaning_flags.is_traffic_heavy,
+        car.cleaning_flags.is_outlap,
+    )
+
+
+def _pit_cache_key(state: RaceState, driver_id: str) -> tuple[Any, ...]:
+    car = state.cars[driver_id]
+    return (
+        driver_id,
+        state.track_status.value,
+        car.tyre_compound.value,
+        car.tyre_age_laps,
+        round(car.last_lap_time_ms or 0.0, 1),
+        round(car.interval_ahead_ms or 0.0, 1),
+        round(car.interval_behind_ms or 0.0, 1),
+        car.cleaning_flags.is_traffic_heavy,
+        tuple(sorted(car.used_dry_compounds)),
+        car.used_wet,
+    )
+
+
+def _record_compound_usage(car: CarState) -> None:
+    if car.tyre_compound in {TyreCompound.SOFT, TyreCompound.MEDIUM, TyreCompound.HARD}:
+        car.used_dry_compounds.add(car.tyre_compound.value)
+    elif car.tyre_compound in {TyreCompound.INTER, TyreCompound.WET}:
+        car.used_wet = True
+
+
+def _race_total_laps(*, state: RaceState, fallback_horizon: int) -> int:
+    return state.total_laps or (state.lap + fallback_horizon)
+
+
+def _first_feasible_action(mask: dict[str, bool]) -> str:
+    for action in ("PIT_TO_MEDIUM", "PIT_TO_HARD", "PIT_TO_SOFT", "PIT_TO_INTER", "PIT_TO_WET"):
+        if mask.get(action, False):
+            return action
+    return "STAY_OUT"
+
+
+def _track_status_from_name(name: str) -> TrackStatus:
+    normalized = name.strip().upper()
+    for status in TrackStatus:
+        if status.value == normalized:
+            return status
+    return TrackStatus.GREEN
+
+
+def _pit_loss_ms(track_status: TrackStatus) -> float:
+    return 12000.0 if track_status in {TrackStatus.SC, TrackStatus.VSC} else 22000.0
+
+
+def _distribution_sigma(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    mean_value = sum(values) / len(values)
+    variance = sum((value - mean_value) ** 2 for value in values) / len(values)
+    return math.sqrt(variance)
+
+
+def _plan_comparison(best_plan: Plan, baseline_plan: Plan) -> PlanComparison:
+    return PlanComparison(
+        baseline_plan_id=baseline_plan.plan_id,
+        delta_time_mean_ms=(
+            best_plan.metrics.delta_time_mean_ms - baseline_plan.metrics.delta_time_mean_ms
+        ),
+        notes="Positive means the selected plan is estimated to outperform the baseline.",
+    )
+
+
+def _plan_actions(current_lap: int, action: str) -> list[dict[str, int | str]]:
+    if action == "STAY_OUT":
+        return []
+    return [{"at_lap": current_lap + 1, "action": action}]
+
+
+def _reference_car(*, state: RaceState, target_driver: str, copy_policy: str) -> CarState | None:
+    ordered = sorted(state.cars.values(), key=lambda car: (car.position, car.driver_id))
+    if copy_policy == "leader":
+        return ordered[0] if ordered and ordered[0].driver_id != target_driver else None
+    target = state.cars[target_driver]
+    for car in ordered:
+        if car.position == target.position - 1:
+            return car
+    return ordered[0] if ordered and ordered[0].driver_id != target_driver else None
+
+
+def _compound_distribution_to_action(distribution: dict[str, float]) -> str:
+    if not distribution:
+        return "PIT_TO_HARD"
+    compound = max(sorted(distribution), key=lambda key: distribution[key])
+    return f"PIT_TO_{compound}"
+
+
+def _pit_action_for_compound(compound: TyreCompound) -> str:
+    if compound is TyreCompound.SOFT:
+        return "PIT_TO_MEDIUM"
+    if compound is TyreCompound.MEDIUM:
+        return "PIT_TO_HARD"
+    if compound is TyreCompound.HARD:
+        return "PIT_TO_MEDIUM"
+    if compound is TyreCompound.INTER:
+        return "PIT_TO_WET"
+    if compound is TyreCompound.WET:
+        return "PIT_TO_INTER"
+    return "PIT_TO_HARD"
+
+
+def _tyre_compound_from_action(action: str) -> TyreCompound:
+    suffix = action.removeprefix("PIT_TO_")
+    for compound in TyreCompound:
+        if compound.value == suffix:
+            return compound
+    return TyreCompound.UNKNOWN
