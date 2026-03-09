@@ -19,6 +19,7 @@ from f1sim.eval.metrics import (
     brier_score,
     calibration_bins,
     quantile,
+    rate_summary,
     summarize_distribution,
 )
 from f1sim.features import FEATURE_SCHEMA_VERSION
@@ -33,6 +34,7 @@ from f1sim.metrics import (
     DELTA_TIME_FORMULA,
     accumulate_plan_total_time,
     compute_delta_time,
+    contribution_breakdown,
     delta_time_cap_ms,
     suspicion_reason_for_delta_time,
 )
@@ -129,11 +131,13 @@ def run_session_evaluation(
     pit_calls = extract_pit_calls(session_rows["laps"])
     action_labels = extract_lap_actions(session_rows)
     ground_truth_summary = summarize_team_calls(pit_calls)
+    regime_map = _build_regime_map(replay_states)
 
     behavioral = _evaluate_behavioral(
         replay_states=replay_states,
         action_labels=action_labels,
         suite=suite,
+        regime_map=regime_map,
     )
     decision_quality = _evaluate_decision_quality(
         replay_states=replay_states,
@@ -145,6 +149,7 @@ def run_session_evaluation(
         copy_policy=copy_policy,
         seed=seed,
         n_scenarios=n_scenarios,
+        regime_map=regime_map,
     )
     behavioral.update(_evaluate_pred_vs_actual(decision_quality["bundles"]))
 
@@ -156,6 +161,7 @@ def run_session_evaluation(
         model_versions=suite.model_versions(),
         config={
             "horizon_laps": horizon_laps,
+            "top_k": 3,
             "copy_policy": copy_policy,
             "seed": seed,
             "n_scenarios": n_scenarios,
@@ -199,9 +205,20 @@ def write_evaluation_outputs(
 
     json_path = output_dir / "evaluation_report.json"
     markdown_path = output_dir / "summary.md"
-    json_path.write_text(json.dumps(report.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
-    markdown_path.write_text(_render_markdown_summary(report), encoding="utf-8")
-    return {"json_path": str(json_path), "markdown_path": str(markdown_path)}
+    metrics_alias_path = output_dir / "eval_metrics.json"
+    markdown_alias_path = output_dir / "eval_report.md"
+    json_payload = json.dumps(report.to_dict(), indent=2, sort_keys=True)
+    markdown_payload = _render_markdown_summary(report)
+    json_path.write_text(json_payload, encoding="utf-8")
+    markdown_path.write_text(markdown_payload, encoding="utf-8")
+    metrics_alias_path.write_text(json_payload, encoding="utf-8")
+    markdown_alias_path.write_text(markdown_payload, encoding="utf-8")
+    return {
+        "json_path": str(json_path),
+        "markdown_path": str(markdown_path),
+        "eval_metrics_path": str(metrics_alias_path),
+        "eval_report_path": str(markdown_alias_path),
+    }
 
 
 def _build_model_suite(thresholds: dict[str, int]) -> ModelSuite:
@@ -346,16 +363,53 @@ def _pit_laps_by_driver(pit_calls: list[Any]) -> dict[str, list[int]]:
     return pit_laps
 
 
+def _build_regime_map(
+    replay_states: list[RaceState],
+) -> dict[tuple[str, int], dict[str, str]]:
+    tyre_ages = [
+        car.tyre_age_laps
+        for state in replay_states
+        for car in state.cars.values()
+    ]
+    early_cut = quantile(tyre_ages, 0.33) or 0.0
+    late_cut = quantile(tyre_ages, 0.67) or early_cut
+    regimes: dict[tuple[str, int], dict[str, str]] = {}
+    for state in replay_states:
+        track_regime = (
+            "SC_VSC" if state.track_status in {TrackStatus.SC, TrackStatus.VSC} else "GREEN"
+        )
+        for driver_id, car in state.cars.items():
+            if car.tyre_age_laps <= early_cut:
+                stint_regime = "EARLY_STINT"
+            elif car.tyre_age_laps >= late_cut:
+                stint_regime = "LATE_STINT"
+            else:
+                stint_regime = "MID_STINT"
+            regimes[(driver_id, state.lap)] = {
+                "track_regime": track_regime,
+                "traffic_regime": (
+                    "TRAFFIC_HEAVY"
+                    if car.cleaning_flags.is_traffic_heavy
+                    else "CLEAN_AIR"
+                ),
+                "stint_regime": stint_regime,
+            }
+    return regimes
+
+
 def _evaluate_behavioral(
     *,
     replay_states: list[RaceState],
     action_labels: dict[tuple[str, int], Any],
     suite: ModelSuite,
+    regime_map: dict[tuple[str, int], dict[str, str]],
 ) -> dict[str, Any]:
     windows = (1, 3, 5)
     window_truths: dict[int, list[int]] = {window: [] for window in windows}
     window_probs: dict[int, list[float]] = {window: [] for window in windows}
     predicted_best_lap_by_state: dict[tuple[int, str], int] = {}
+    window_hit_pm1_records: list[dict[str, object]] = []
+    window_hit_pm2_records: list[dict[str, object]] = []
 
     for state in replay_states:
         if state.track_status is TrackStatus.RED:
@@ -386,6 +440,21 @@ def _evaluate_behavioral(
         predicted_best = predicted_best_lap_by_state.get((pit_lap - 1, driver_id))
         if predicted_best is not None:
             pit_timing_errors.append(abs(predicted_best - pit_lap))
+            regime = regime_map.get((driver_id, max(1, pit_lap - 1)), {})
+            window_hit_pm1_records.append(
+                {
+                    "driver_id": driver_id,
+                    "value": abs(predicted_best - pit_lap) <= 1,
+                    **regime,
+                }
+            )
+            window_hit_pm2_records.append(
+                {
+                    "driver_id": driver_id,
+                    "value": abs(predicted_best - pit_lap) <= 2,
+                    **regime,
+                }
+            )
 
     return {
         "pit_in_window": {
@@ -405,6 +474,10 @@ def _evaluate_behavioral(
             "count": len(pit_timing_errors),
             "median_abs_error_laps": median(pit_timing_errors) if pit_timing_errors else None,
             "p90_abs_error_laps": quantile(pit_timing_errors, 0.90),
+        },
+        "pit_window_hit_rate": {
+            "pm1": rate_summary(window_hit_pm1_records),
+            "pm2": rate_summary(window_hit_pm2_records),
         },
     }
 
@@ -431,27 +504,57 @@ def _predicted_best_pit_lap(*, state: RaceState, driver_id: str, suite: ModelSui
 
 
 def _evaluate_pred_vs_actual(bundle_rows: list[dict[str, Any]]) -> dict[str, Any]:
-    action_correct = 0
-    action_total = 0
-    compound_correct = 0
-    compound_total = 0
+    action_records: list[dict[str, object]] = []
+    topk_records: list[dict[str, object]] = []
+    compound_records: list[dict[str, object]] = []
 
     for row in bundle_rows:
         bundle = row["recommendation_bundle"]
         top_plan = bundle["top_k"][0]
         predicted_action = _predicted_immediate_action(top_plan)
         actual_action = bundle["ground_truth"]["actual_action"]
-        action_total += 1
-        action_correct += int(predicted_action == actual_action)
+        regime = dict(row.get("regime", {}))
+        action_records.append(
+            {
+                "driver_id": row["driver_id"],
+                "value": predicted_action == actual_action,
+                **regime,
+            }
+        )
+        topk_actions = [_predicted_immediate_action(plan) for plan in bundle["top_k"]]
+        topk_records.append(
+            {
+                "driver_id": row["driver_id"],
+                "value": actual_action in topk_actions,
+                **regime,
+            }
+        )
         if actual_action == "PIT":
-            compound_total += 1
             predicted_compound = _predicted_compound(top_plan)
             actual_compound = bundle["ground_truth"]["actual_compound_after"]
-            compound_correct += int(predicted_compound == actual_compound)
+            compound_records.append(
+                {
+                    "driver_id": row["driver_id"],
+                    "value": predicted_compound == actual_compound,
+                    **regime,
+                }
+            )
+
+    action_summary = rate_summary(action_records)
+    compound_summary = rate_summary(compound_records)
+    topk_summary = rate_summary(topk_records)
 
     return {
-        "top1_action_accuracy": action_correct / action_total if action_total else None,
-        "pit_compound_accuracy": compound_correct / compound_total if compound_total else None,
+        "top1_action_accuracy": action_summary["overall"]["value"],
+        "top1_action_accuracy_n": action_summary["overall"]["n"],
+        "top1_action_accuracy_detail": action_summary,
+        "topk_action_coverage": {
+            "k": 3,
+            **topk_summary,
+        },
+        "pit_compound_accuracy": compound_summary["overall"]["value"],
+        "pit_compound_accuracy_n": compound_summary["overall"]["n"],
+        "pit_compound_accuracy_detail": compound_summary,
     }
 
 
@@ -466,6 +569,7 @@ def _evaluate_decision_quality(
     copy_policy: str,
     seed: int,
     n_scenarios: int,
+    regime_map: dict[tuple[str, int], dict[str, str]],
 ) -> dict[str, Any]:
     bundle_rows: list[dict[str, Any]] = []
     emitted_plan_count = 0
@@ -514,6 +618,7 @@ def _evaluate_decision_quality(
                         for name, plan in baseline_plans.items()
                     },
                     "selected_plan_id": bundle.top_k[0].plan_id,
+                    "regime": dict(regime_map.get((driver_id, state.lap), {})),
                 }
             )
 
@@ -525,6 +630,7 @@ def _evaluate_decision_quality(
         "rule_violation_rate": (
             emitted_rule_violations / emitted_plan_count if emitted_plan_count else 0.0
         ),
+        "bundles_evaluated": len(bundle_rows),
         "bundles": bundle_rows,
     }
 
@@ -791,10 +897,36 @@ def _plan_from_distribution(
     horizon_laps = len(distribution[0].per_lap_times_ms) if distribution else 0
     pit_loss_ms_used = sum(outcome.pit_loss_ms_used for outcome in distribution) / len(distribution)
     component_totals = _mean_component_totals(distribution)
+    baseline_pit_loss_ms = sum(
+        outcome.pit_loss_ms_used for outcome in baseline_distribution
+    ) / len(baseline_distribution)
+    baseline_component_totals = _mean_component_totals(baseline_distribution)
     suspicion_reason = suspicion_reason_for_delta_time(
         delta_time_ms=mean_delta,
         horizon_laps=max(horizon_laps, 1),
     )
+    diagnostics = {
+        "horizon_laps": horizon_laps,
+        "n_scenarios": n_scenarios,
+        "seed": seed,
+        "pit_loss_ms_used": pit_loss_ms_used,
+        "baseline_pit_loss_ms": baseline_pit_loss_ms,
+        "plan_component_totals_ms": dict(component_totals),
+        "baseline_component_totals_ms": dict(baseline_component_totals),
+        "per_lap_time_components_summary_ms": {
+            f"{component}_mean_ms": total / horizon_laps if horizon_laps else 0.0
+            for component, total in component_totals.items()
+        },
+        "baseline_total_time_ms": baseline_total_time_ms,
+        "plan_total_time_ms": plan_total_time_ms,
+        "plan_total_time_p10_ms": quantile(plan_totals, 0.10) or plan_total_time_ms,
+        "plan_total_time_p50_ms": plan_total_time_p50_ms,
+        "plan_total_time_p90_ms": quantile(plan_totals, 0.90) or plan_total_time_ms,
+        "baseline_total_time_p50_ms": baseline_total_time_p50_ms,
+        "delta_time_cap_ms": delta_time_cap_ms(horizon_laps=max(horizon_laps, 1)),
+        "is_suspicious": suspicion_reason is not None,
+        "suspicion_reason": suspicion_reason,
+    }
     counterfactuals = {
         "vs_STAY_OUT": {
             "delta_time_mean_ms": mean_delta,
@@ -824,25 +956,13 @@ def _plan_from_distribution(
             race_total_laps=race_total_laps,
         ),
         counterfactuals=counterfactuals,
-        diagnostics={
-            "horizon_laps": horizon_laps,
-            "n_scenarios": n_scenarios,
-            "seed": seed,
-            "pit_loss_ms_used": pit_loss_ms_used,
-            "per_lap_time_components_summary_ms": {
-                f"{component}_mean_ms": total / horizon_laps if horizon_laps else 0.0
-                for component, total in component_totals.items()
-            },
-            "baseline_total_time_ms": baseline_total_time_ms,
-            "plan_total_time_ms": plan_total_time_ms,
-            "plan_total_time_p10_ms": quantile(plan_totals, 0.10) or plan_total_time_ms,
-            "plan_total_time_p50_ms": plan_total_time_p50_ms,
-            "plan_total_time_p90_ms": quantile(plan_totals, 0.90) or plan_total_time_ms,
-            "baseline_total_time_p50_ms": baseline_total_time_p50_ms,
-            "delta_time_cap_ms": delta_time_cap_ms(horizon_laps=max(horizon_laps, 1)),
-            "is_suspicious": suspicion_reason is not None,
-            "suspicion_reason": suspicion_reason,
-        },
+        contributions=contribution_breakdown(
+            plan_pit_loss_ms=float(diagnostics["pit_loss_ms_used"]),
+            baseline_pit_loss_ms=float(diagnostics["baseline_pit_loss_ms"]),
+            plan_components_ms=dict(diagnostics["plan_component_totals_ms"]),
+            baseline_components_ms=dict(diagnostics["baseline_component_totals_ms"]),
+        ),
+        diagnostics=diagnostics,
         is_suspicious=suspicion_reason is not None,
         suspicion_reason=suspicion_reason,
     )
@@ -1089,6 +1209,7 @@ def _serialize_plan(plan: Plan) -> dict[str, Any]:
             for explanation in plan.explanations
         ],
         "counterfactuals": dict(plan.counterfactuals),
+        "contributions": dict(plan.contributions),
         "diagnostics": dict(plan.diagnostics),
         "is_suspicious": plan.is_suspicious,
         "suspicion_reason": plan.suspicion_reason,
@@ -1096,6 +1217,9 @@ def _serialize_plan(plan: Plan) -> dict[str, Any]:
 
 
 def _render_markdown_summary(report: EvaluationReport) -> str:
+    topk_overall = report.behavioral["topk_action_coverage"]["overall"]
+    pm1_overall = report.behavioral["pit_window_hit_rate"]["pm1"]["overall"]
+    pm2_overall = report.behavioral["pit_window_hit_rate"]["pm2"]["overall"]
     lines = [
         f"# Evaluation Summary: {report.session_id}",
         "",
@@ -1103,6 +1227,10 @@ def _render_markdown_summary(report: EvaluationReport) -> str:
         f"- Feature schema version: {report.feature_schema_version}",
         f"- Assumptions hash: `{report.assumptions_hash}`",
         f"- Model versions: `{json.dumps(report.model_versions, sort_keys=True)}`",
+        f"- Seed: `{report.config['seed']}`",
+        f"- Horizon: `{report.config['horizon_laps']}`",
+        f"- Top-K: `{report.config['top_k']}`",
+        f"- N scenarios: `{report.config['n_scenarios']}`",
         "",
         "## Δtime Definition",
         "",
@@ -1111,6 +1239,39 @@ def _render_markdown_summary(report: EvaluationReport) -> str:
         "- Units: milliseconds (`ms`)",
         "",
         "## Layer 1 Behavioral",
+        "",
+        "| Metric | Value | n |",
+        "| --- | --- | --- |",
+        _metric_row(
+            "Top-1 action accuracy",
+            _fmt(report.behavioral["top1_action_accuracy"]),
+            report.behavioral["top1_action_accuracy_n"],
+        ),
+        _metric_row(
+            "Top-K coverage (K=3)",
+            _fmt(topk_overall["value"]),
+            topk_overall["n"],
+        ),
+        _metric_row(
+            "Window hit ±1",
+            _fmt(pm1_overall["value"]),
+            pm1_overall["n"],
+        ),
+        _metric_row(
+            "Window hit ±2",
+            _fmt(pm2_overall["value"]),
+            pm2_overall["n"],
+        ),
+        _metric_row(
+            "Compound accuracy on PIT laps",
+            _fmt(report.behavioral["pit_compound_accuracy"]),
+            report.behavioral["pit_compound_accuracy_n"],
+        ),
+        _metric_row(
+            "Rule violation rate",
+            _fmt(report.decision_quality["rule_violation_rate"]),
+            report.decision_quality["bundles_evaluated"],
+        ),
         "",
     ]
     for window, metrics in report.behavioral["pit_in_window"].items():
@@ -1125,10 +1286,16 @@ def _render_markdown_summary(report: EvaluationReport) -> str:
             "",
             f"- Pit timing error median={_fmt(timing['median_abs_error_laps'])} laps, "
             f"p90={_fmt(timing['p90_abs_error_laps'])} laps, n={timing['count']}",
-            f"- Top-1 action accuracy={_fmt(report.behavioral['top1_action_accuracy'])}",
-            f"- Pit compound accuracy={_fmt(report.behavioral['pit_compound_accuracy'])}",
+            f"- Top-1 action accuracy={_fmt(report.behavioral['top1_action_accuracy'])} "
+            f"(n={report.behavioral['top1_action_accuracy_n']})",
+            f"- Top-K coverage={_fmt(topk_overall['value'])} (n={topk_overall['n']})",
+            f"- Window hit ±1={_fmt(pm1_overall['value'])} (n={pm1_overall['n']})",
+            f"- Window hit ±2={_fmt(pm2_overall['value'])} (n={pm2_overall['n']})",
+            f"- Pit compound accuracy={_fmt(report.behavioral['pit_compound_accuracy'])} "
+            f"(n={report.behavioral['pit_compound_accuracy_n']})",
             "",
-            f"- Rule violation rate={_fmt(report.decision_quality['rule_violation_rate'])}",
+            f"- Rule violation rate={_fmt(report.decision_quality['rule_violation_rate'])} "
+            f"(n={report.decision_quality['bundles_evaluated']})",
             "",
             "## Layer 2 Decision Quality",
             "",
@@ -1190,6 +1357,10 @@ def _fmt(value: Any) -> str:
     if isinstance(value, float) and math.isfinite(value):
         return f"{value:.3f}"
     return str(value)
+
+
+def _metric_row(name: str, value: Any, count: Any) -> str:
+    return f"| {name} | {value} | {count} |"
 
 
 def _pred_vs_actual_sample(bundle_rows: list[dict[str, Any]]) -> list[dict[str, object]]:

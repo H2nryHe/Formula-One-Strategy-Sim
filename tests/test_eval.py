@@ -309,6 +309,12 @@ def test_run_session_evaluation_returns_stable_schema(tmp_path) -> None:
     assert "w5" in report.behavioral["pit_in_window"]
     assert report.behavioral["pit_timing_error"]["count"] >= 1
     assert report.behavioral["top1_action_accuracy"] is not None
+    assert report.behavioral["topk_action_coverage"]["overall"]["value"] is not None
+    assert report.behavioral["pit_window_hit_rate"]["pm1"]["overall"]["n"] >= 1
+    assert (
+        report.behavioral["pit_window_hit_rate"]["pm2"]["overall"]["value"]
+        >= report.behavioral["pit_window_hit_rate"]["pm1"]["overall"]["value"]
+    )
     assert report.behavioral["pit_compound_accuracy"] is not None
     assert "STAY_OUT" in report.decision_quality["summary_by_baseline"]
     assert "RULE_TYRE_AGE" in report.decision_quality["summary_by_baseline"]
@@ -325,6 +331,7 @@ def test_run_session_evaluation_returns_stable_schema(tmp_path) -> None:
     assert "ground_truth" in first_bundle
     assert first_bundle["model_versions"]["search"] == "rollout_search_v0.2"
     assert "diagnostics" in first_bundle["top_k"][0]
+    assert "contributions" in first_bundle["top_k"][0]
     assert "plan_total_time_ms" in first_bundle["top_k"][0]["diagnostics"]
     assert report.ground_truth_summary["pits_per_driver"]
 
@@ -347,6 +354,8 @@ def test_write_evaluation_outputs_creates_json_and_markdown(tmp_path) -> None:
 
     assert outputs["json_path"].endswith("evaluation_report.json")
     assert outputs["markdown_path"].endswith("summary.md")
+    assert outputs["eval_metrics_path"].endswith("eval_metrics.json")
+    assert outputs["eval_report_path"].endswith("eval_report.md")
     assert json_payload["session_id"] == "2023_unit_test_gp_r"
     assert "decision_quality" in json_payload
     assert "ground_truth_summary" in json_payload
@@ -354,6 +363,8 @@ def test_write_evaluation_outputs_creates_json_and_markdown(tmp_path) -> None:
     assert json_payload["config"]["delta_time"]["units"] == "ms"
     assert "Layer 1 Behavioral" in markdown
     assert "## Δtime Definition" in markdown
+    assert "Top-K coverage (K=3)" in markdown
+    assert "Window hit ±1" in markdown
     assert "COPY_LEADER" in markdown
     assert "Rule violation rate=0.000" in markdown
     assert "Pred vs Actual Sample" in markdown

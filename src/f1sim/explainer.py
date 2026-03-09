@@ -51,7 +51,8 @@ def build_plan_explanations(
     reference_gap_ms = 0.0
     if reference is not None:
         reference_gap_ms = reference.interval_behind_ms or car.interval_ahead_ms or 0.0
-    if reference is not None and reference_gap_ms <= 3000.0:
+    undercut_effect_ms = abs(plan.contributions.get("pace_gain_ms", 0.0))
+    if reference is not None and reference_gap_ms <= 2000.0 and undercut_effect_ms >= 250.0:
         explanations.append(
             Explanation(
                 code="UNDERCUT_THREAT",
@@ -64,7 +65,8 @@ def build_plan_explanations(
             )
         )
 
-    if car.cleaning_flags.is_traffic_heavy:
+    traffic_effect_ms = abs(plan.contributions.get("traffic_effect_ms", 0.0))
+    if car.cleaning_flags.is_traffic_heavy and traffic_effect_ms >= 0.0:
         explanations.append(
             Explanation(
                 code="TRAFFIC_PENALTY",
@@ -143,15 +145,20 @@ def build_plan_explanations(
         if explanation.code not in seen_codes:
             unique.append(explanation)
             seen_codes.add(explanation.code)
-    if len(unique) <= 4:
-        return unique
-    compliance = [explanation for explanation in unique if explanation.code == "RULE_COMPLIANCE"]
-    if not compliance:
-        return unique[:4]
-    trimmed = compliance + [
-        explanation for explanation in unique if explanation.code != "RULE_COMPLIANCE"
-    ]
-    return trimmed[:4]
+    priority = {
+        "RULE_COMPLIANCE": 0,
+        "SC_WINDOW": 1,
+        "UNDERCUT_THREAT": 2,
+        "TRAFFIC_PENALTY": 3,
+        "TRACK_POSITION": 4,
+        "TYRE_CLIFF": 5,
+        "RAIN_RISK": 6,
+    }
+    ranked = sorted(
+        unique,
+        key=lambda explanation: priority.get(explanation.code, 99),
+    )
+    return ranked[:3]
 
 
 def build_plan_counterfactuals(
@@ -187,13 +194,23 @@ def _best_pit_next_lap_plan(plans_by_id: dict[str, Plan]) -> Plan | None:
     pit_plans = [plan for plan in plans_by_id.values() if _plan_action(plan) != "STAY_OUT"]
     if not pit_plans:
         return None
-    return max(pit_plans, key=lambda plan: plan.metrics.delta_time_mean_ms)
+    earliest_lap = min(_plan_first_action_lap(plan) for plan in pit_plans)
+    earliest_pit_plans = [
+        plan for plan in pit_plans if _plan_first_action_lap(plan) == earliest_lap
+    ]
+    return max(earliest_pit_plans, key=lambda plan: plan.metrics.delta_time_mean_ms)
 
 
 def _plan_action(plan: Plan) -> str:
     if not plan.actions:
         return "STAY_OUT"
     return str(plan.actions[0]["action"])
+
+
+def _plan_first_action_lap(plan: Plan) -> int:
+    if not plan.actions:
+        return 10**9
+    return int(plan.actions[0]["at_lap"])
 
 
 def _car_ahead(state: RaceState, target_driver: str) -> Any:

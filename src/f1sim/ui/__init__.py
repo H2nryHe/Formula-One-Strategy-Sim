@@ -2,6 +2,8 @@
 
 from f1sim.ui.service import (
     build_demo_payload,
+    build_key_moments,
+    build_race_situation_panel,
     build_timeline_rows,
     list_drivers,
     list_sessions,
@@ -10,6 +12,8 @@ from f1sim.ui.service import (
 
 __all__ = [
     "build_demo_payload",
+    "build_key_moments",
+    "build_race_situation_panel",
     "build_timeline_rows",
     "list_drivers",
     "list_sessions",

@@ -39,6 +39,14 @@ def test_rollout_search_returns_valid_top_k_bundle() -> None:
     assert "plan_total_time_ms" in bundle.top_k[0].diagnostics
     assert "baseline_total_time_ms" in bundle.top_k[0].diagnostics
     assert "pit_loss_ms_used" in bundle.top_k[0].diagnostics
+    assert all(
+        action["action"] == "STAY_OUT" or str(action["action"]).startswith("PIT_TO_")
+        for plan in bundle.top_k
+        for action in plan.actions
+    )
+    for plan in bundle.top_k:
+        contribution_sum = sum(plan.contributions.values())
+        assert abs(contribution_sum - plan.metrics.delta_time_mean_ms) < 1e-6
 
 
 def test_rollout_search_is_deterministic_for_same_seed() -> None:
@@ -91,6 +99,7 @@ def test_recommend_cli_outputs_bundle_json(tmp_path) -> None:
     assert payload["ground_truth"]["actual_action"] in {"STAY_OUT", "PIT"}
     assert "diagnostics" in payload["top_k"][0]
     assert "plan_total_time_ms" in payload["top_k"][0]["diagnostics"]
+    assert "contributions" in payload["top_k"][0]
 
 
 def test_rollout_search_enforces_two_dry_rule_deadline() -> None:
@@ -114,11 +123,38 @@ def test_rollout_search_enforces_two_dry_rule_deadline() -> None:
     bundle = searcher.recommend(state, "VER", horizon_laps=5, top_k=3, seed=23)
 
     assert bundle.top_k
-    assert all(plan.plan_id in {"PIT_TO_MEDIUM", "PIT_TO_HARD"} for plan in bundle.top_k)
+    assert all(plan.plan_id.startswith(("PIT_TO_MEDIUM", "PIT_TO_HARD")) for plan in bundle.top_k)
     assert all(
         plan_satisfies_rules(state, "VER", plan, state.total_laps or 53) for plan in bundle.top_k
     )
     assert any(
         explanation.code == "RULE_COMPLIANCE"
         for explanation in bundle.top_k[0].explanations
+    )
+
+
+def test_rollout_search_generates_delayed_pit_candidates() -> None:
+    state = build_bootstrap_state()
+    searcher = RolloutStrategySearcher(
+        suite=build_model_suite(),
+        config=RolloutSearchConfig(horizon_laps=6, n_scenarios=4, top_k=3),
+    )
+
+    candidates = searcher._candidate_plans(
+        state=state,
+        target_driver="LEC",
+        horizon_laps=6,
+        race_total_laps=state.total_laps or 58,
+    )
+
+    delayed_pit_plans = [
+        plan
+        for plan in candidates
+        if plan.actions and int(plan.actions[0]["at_lap"]) > state.lap + 1
+    ]
+
+    assert delayed_pit_plans
+    assert all(
+        str(plan.actions[0]["action"]).startswith("PIT_TO_")
+        for plan in delayed_pit_plans
     )

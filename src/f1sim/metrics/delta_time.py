@@ -70,10 +70,38 @@ def suspicion_reason_for_delta_time(
     )
 
 
+def contribution_breakdown(
+    *,
+    plan_pit_loss_ms: float,
+    baseline_pit_loss_ms: float,
+    plan_components_ms: dict[str, float],
+    baseline_components_ms: dict[str, float],
+) -> dict[str, float]:
+    return {
+        "pit_loss_ms": compute_delta_time(plan_pit_loss_ms, baseline_pit_loss_ms),
+        "pace_gain_ms": compute_delta_time(
+            plan_components_ms.get("base", 0.0) + plan_components_ms.get("weather", 0.0),
+            baseline_components_ms.get("base", 0.0) + baseline_components_ms.get("weather", 0.0),
+        ),
+        "traffic_effect_ms": compute_delta_time(
+            plan_components_ms.get("traffic", 0.0),
+            baseline_components_ms.get("traffic", 0.0),
+        ),
+        "status_effect_ms": compute_delta_time(
+            plan_components_ms.get("track_status", 0.0),
+            baseline_components_ms.get("track_status", 0.0),
+        ),
+        "degr_effect_ms": compute_delta_time(
+            plan_components_ms.get("degradation", 0.0),
+            baseline_components_ms.get("degradation", 0.0),
+        ),
+    }
+
+
 def _assert_time_ms(value: float, *, name: str, allow_zero: bool = False) -> None:
     if not math.isfinite(value):
         raise ValueError(f"{name} must be finite")
     if value < 0.0:
         raise ValueError(f"{name} must be non-negative milliseconds")
-    if value == 0.0 and not allow_zero:
-        raise ValueError(f"{name} must be positive milliseconds")
+    if value == 0.0 and allow_zero:
+        return

@@ -131,3 +131,38 @@ def calibration_bins(
         actual_rate = sum(truth for truth, _ in entries) / len(entries)
         results.append(CalibrationBin(lower, upper, len(entries), avg_pred, actual_rate))
     return results
+
+
+def rate_summary(
+    records: list[dict[str, object]],
+    *,
+    outcome_key: str = "value",
+    driver_key: str = "driver_id",
+    regime_keys: tuple[str, ...] = ("track_regime", "traffic_regime", "stint_regime"),
+) -> dict[str, object]:
+    def summarize(items: list[dict[str, object]]) -> dict[str, float | int | None]:
+        if not items:
+            return {"value": None, "n": 0}
+        values = [int(bool(item[outcome_key])) for item in items]
+        return {"value": sum(values) / len(values), "n": len(values)}
+
+    per_driver: dict[str, dict[str, float | int | None]] = {}
+    for driver_id in sorted({str(record[driver_key]) for record in records}):
+        subset = [record for record in records if str(record[driver_key]) == driver_id]
+        per_driver[driver_id] = summarize(subset)
+
+    per_regime: dict[str, dict[str, dict[str, float | int | None]]] = {}
+    for regime_key in regime_keys:
+        labels = sorted({str(record[regime_key]) for record in records if regime_key in record})
+        per_regime[regime_key] = {
+            label: summarize(
+                [record for record in records if str(record.get(regime_key)) == label]
+            )
+            for label in labels
+        }
+
+    return {
+        "overall": summarize(records),
+        "per_driver": per_driver,
+        "per_regime": per_regime,
+    }

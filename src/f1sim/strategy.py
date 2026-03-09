@@ -22,6 +22,7 @@ from f1sim.features import FEATURE_SCHEMA_VERSION
 from f1sim.metrics import (
     accumulate_plan_total_time,
     compute_delta_time,
+    contribution_breakdown,
     delta_time_cap_ms,
     suspicion_reason_for_delta_time,
 )
@@ -88,6 +89,12 @@ class SimulationOutcome:
     pit_loss_ms_used: float
     per_lap_times_ms: list[float]
     pace_component_totals_ms: dict[str, float]
+
+
+@dataclass(frozen=True, slots=True)
+class CandidatePlanSpec:
+    plan_id: str
+    actions: tuple[dict[str, int | str], ...]
 
 
 def build_model_suite(rule_thresholds: dict[str, int] | None = None) -> ModelSuite:
@@ -174,51 +181,50 @@ class RolloutStrategySearcher:
 
         thresholds = self.config.resolved_thresholds()
         race_total_laps = _race_total_laps(state=state, fallback_horizon=horizon_laps)
-        rule_mask = action_mask(
-            state,
-            target_driver,
-            state.lap,
-            race_total_laps,
-            deadline_laps=self.config.two_dry_deadline_laps,
-        )
         scenarios = self.suite.scenario_model.sample_scenarios(
             state,
             horizon_laps=horizon_laps,
             n=self.config.n_scenarios,
             seed=seed,
         )
-        candidate_actions = self._candidate_actions(state)
+        candidate_plans = self._candidate_plans(
+            state=state,
+            target_driver=target_driver,
+            horizon_laps=horizon_laps,
+            race_total_laps=race_total_laps,
+        )
         stay_out_outcomes = self._simulate_plan(
             state=state,
             target_driver=target_driver,
-            action="STAY_OUT",
+            plan_actions=(),
             scenarios=scenarios,
             seed=seed,
         )
 
-        action_outcomes: dict[str, list[SimulationOutcome]] = {"STAY_OUT": stay_out_outcomes}
-        for action in candidate_actions:
-            if action == "STAY_OUT":
+        plan_outcomes: dict[str, list[SimulationOutcome]] = {"STAY_OUT": stay_out_outcomes}
+        for plan_spec in candidate_plans:
+            if plan_spec.plan_id == "STAY_OUT":
                 continue
-            action_outcomes[action] = self._simulate_plan(
+            plan_outcomes[plan_spec.plan_id] = self._simulate_plan(
                 state=state,
                 target_driver=target_driver,
-                action=action,
+                plan_actions=plan_spec.actions,
                 scenarios=scenarios,
                 seed=seed,
             )
 
         plans = {
-            action: self._plan_from_outcomes(
+            plan_spec.plan_id: self._plan_from_outcomes(
                 state=state,
                 target_driver=target_driver,
-                plan_id=action,
-                action=action,
+                plan_id=plan_spec.plan_id,
+                actions=list(plan_spec.actions),
                 outcomes=outcomes,
                 baseline_outcomes=stay_out_outcomes,
                 seed=seed,
             )
-            for action, outcomes in action_outcomes.items()
+            for plan_spec in candidate_plans
+            for outcomes in [plan_outcomes[plan_spec.plan_id]]
         }
         for plan in plans.values():
             plan.explanations = build_plan_explanations(
@@ -234,10 +240,14 @@ class RolloutStrategySearcher:
             )
             plan.counterfactuals = build_plan_counterfactuals(plan=plan, plans_by_id=plans)
         feasible_plan_ids = [
-            action
-            for action in candidate_actions
-            if rule_mask.get(action, True)
-            and plan_satisfies_rules(state, target_driver, plans[action], race_total_laps)
+            plan_spec.plan_id
+            for plan_spec in candidate_plans
+            if self._plan_is_feasible(
+                state=state,
+                target_driver=target_driver,
+                plan=plans[plan_spec.plan_id],
+                race_total_laps=race_total_laps,
+            )
         ]
         ranked = sorted(
             (plans[action] for action in feasible_plan_ids),
@@ -254,9 +264,17 @@ class RolloutStrategySearcher:
 
         baseline_plans = {
             "STAY_OUT": plans["STAY_OUT"],
-            "RULE_TYRE_AGE": plans[self._rule_tyre_age_action(state, target_driver, thresholds)],
+            "RULE_TYRE_AGE": plans[
+                self._resolve_baseline_plan_id(
+                    plans=plans,
+                    action=self._rule_tyre_age_action(state, target_driver, thresholds),
+                )
+            ],
             f"COPY_{self.config.copy_policy.upper()}": plans[
-                self._copy_action(state, target_driver, self.config.copy_policy)
+                self._resolve_baseline_plan_id(
+                    plans=plans,
+                    action=self._copy_action(state, target_driver, self.config.copy_policy),
+                )
             ],
         }
         best_plan = selected[0]
@@ -277,9 +295,15 @@ class RolloutStrategySearcher:
         )
         return bundle, baseline_plans
 
-    def _candidate_actions(self, state: RaceState) -> list[str]:
+    def _candidate_plans(
+        self,
+        *,
+        state: RaceState,
+        target_driver: str,
+        horizon_laps: int,
+        race_total_laps: int,
+    ) -> list[CandidatePlanSpec]:
         actions = [
-            "STAY_OUT",
             "PIT_TO_SOFT",
             "PIT_TO_MEDIUM",
             "PIT_TO_HARD",
@@ -293,18 +317,86 @@ class RolloutStrategySearcher:
         )
         if wet_context:
             actions.extend(["PIT_TO_INTER", "PIT_TO_WET"])
-        return actions
+        plans = [CandidatePlanSpec(plan_id="STAY_OUT", actions=())]
+        max_delay = min(horizon_laps, max(0, race_total_laps - state.lap))
+        for delay in range(1, max_delay + 1):
+            planned_lap = state.lap + delay
+            for action in actions:
+                plan = Plan(
+                    plan_id=_plan_id_for_scheduled_action(action, delay),
+                    actions=_plan_actions(state.lap, action, delay_laps=delay),
+                    metrics=PlanMetrics(
+                        delta_time_mean_ms=0.0,
+                        delta_time_p10_ms=0.0,
+                        delta_time_p50_ms=0.0,
+                        delta_time_p90_ms=0.0,
+                        p_gain_pos_ge_1=0.0,
+                        risk_sigma_ms=0.0,
+                    ),
+                )
+                if not _plan_respects_rule_deadline(
+                    state=state,
+                    driver_id=target_driver,
+                    plan=plan,
+                    race_total_laps=race_total_laps,
+                    deadline_laps=self.config.two_dry_deadline_laps,
+                    planned_lap=planned_lap,
+                ):
+                    continue
+                plans.append(
+                    CandidatePlanSpec(
+                        plan_id=plan.plan_id,
+                        actions=tuple(plan.actions),
+                    )
+                )
+        return plans
+
+    def _plan_is_feasible(
+        self,
+        *,
+        state: RaceState,
+        target_driver: str,
+        plan: Plan,
+        race_total_laps: int,
+    ) -> bool:
+        return plan_satisfies_rules(state, target_driver, plan, race_total_laps) and (
+            _plan_respects_rule_deadline(
+                state=state,
+                driver_id=target_driver,
+                plan=plan,
+                race_total_laps=race_total_laps,
+                deadline_laps=self.config.two_dry_deadline_laps,
+            )
+        )
+
+    @staticmethod
+    def _resolve_baseline_plan_id(*, plans: dict[str, Plan], action: str) -> str:
+        if action == "STAY_OUT":
+            return "STAY_OUT"
+        immediate_plan_id = _plan_id_for_scheduled_action(action, delay_laps=1)
+        if immediate_plan_id in plans:
+            return immediate_plan_id
+        fallback_plan_ids = sorted(
+            plan_id for plan_id in plans if plan_id.startswith(f"{action}_L+")
+        )
+        if fallback_plan_ids:
+            return fallback_plan_ids[0]
+        return "STAY_OUT"
 
     def _simulate_plan(
         self,
         *,
         state: RaceState,
         target_driver: str,
-        action: str,
+        plan_actions: tuple[dict[str, int | str], ...],
         scenarios: list[Scenario],
         seed: int,
     ) -> list[SimulationOutcome]:
         outcomes: list[SimulationOutcome] = []
+        target_action_schedule = {
+            int(action["at_lap"]): str(action["action"])
+            for action in plan_actions
+        }
         for scenario_index, scenario in enumerate(scenarios):
             rng = random.Random(seed + scenario_index * 10007 + sum(map(ord, target_driver)))
             sim_state = _clone_state(state)
@@ -333,7 +425,10 @@ class RolloutStrategySearcher:
                 planned_actions: dict[str, str] = {}
                 for driver_id, _car in sim_state.cars.items():
                     if driver_id == target_driver:
-                        planned_actions[driver_id] = action if step == 1 else "STAY_OUT"
+                        planned_actions[driver_id] = target_action_schedule.get(
+                            state.lap + step,
+                            "STAY_OUT",
+                        )
                         continue
                     if has_pitted[driver_id]:
                         planned_actions[driver_id] = "STAY_OUT"
@@ -511,7 +606,7 @@ class RolloutStrategySearcher:
         state: RaceState,
         target_driver: str,
         plan_id: str,
-        action: str,
+        actions: list[dict[str, int | str]],
         outcomes: list[SimulationOutcome],
         baseline_outcomes: list[SimulationOutcome],
         seed: int,
@@ -534,6 +629,7 @@ class RolloutStrategySearcher:
             plan_totals=plan_totals,
             baseline_totals=baseline_totals,
             outcomes=outcomes,
+            baseline_outcomes=baseline_outcomes,
             deltas=deltas,
             horizon_laps=horizon_laps,
             n_scenarios=len(outcomes),
@@ -543,9 +639,17 @@ class RolloutStrategySearcher:
             risk_sigma_ms=sigma,
             component_totals=component_totals,
         )
+        diagnostics["scheduled_pit_lap"] = (
+            int(actions[0]["at_lap"]) if actions else None
+        )
+        diagnostics["scheduled_compound"] = _planned_compound_from_actions(actions)
+        diagnostics["immediate_action"] = _immediate_action_for_plan(
+            current_lap=state.lap,
+            actions=actions,
+        )
         return Plan(
             plan_id=plan_id,
-            actions=_plan_actions(state.lap, action),
+            actions=actions,
             metrics=PlanMetrics(
                 delta_time_mean_ms=mean_delta,
                 delta_time_p10_ms=quantile(deltas, 0.10) or mean_delta,
@@ -556,6 +660,7 @@ class RolloutStrategySearcher:
             ),
             explanations=[],
             counterfactuals={},
+            contributions=_build_plan_contributions(diagnostics),
             diagnostics=diagnostics,
             is_suspicious=bool(diagnostics["is_suspicious"]),
             suspicion_reason=(
@@ -636,6 +741,7 @@ def _plan_to_dict(plan: Plan) -> dict[str, Any]:
         "metrics": asdict(plan.metrics),
         "explanations": [asdict(explanation) for explanation in plan.explanations],
         "counterfactuals": dict(plan.counterfactuals),
+        "contributions": dict(plan.contributions),
         "diagnostics": dict(plan.diagnostics),
         "is_suspicious": plan.is_suspicious,
         "suspicion_reason": plan.suspicion_reason,
@@ -751,10 +857,57 @@ def _plan_comparison(best_plan: Plan, baseline_plan: Plan) -> PlanComparison:
     )
 
 
-def _plan_actions(current_lap: int, action: str) -> list[dict[str, int | str]]:
+def _plan_actions(
+    current_lap: int,
+    action: str,
+    *,
+    delay_laps: int = 1,
+) -> list[dict[str, int | str]]:
     if action == "STAY_OUT":
         return []
-    return [{"at_lap": current_lap + 1, "action": action}]
+    return [{"at_lap": current_lap + delay_laps, "action": action}]
+
+
+def _plan_id_for_scheduled_action(action: str, delay_laps: int) -> str:
+    if action == "STAY_OUT":
+        return "STAY_OUT"
+    return f"{action}_L+{delay_laps}"
+
+
+def _plan_respects_rule_deadline(
+    *,
+    state: RaceState,
+    driver_id: str,
+    plan: Plan,
+    race_total_laps: int,
+    deadline_laps: int,
+    planned_lap: int | None = None,
+) -> bool:
+    car = state.cars[driver_id]
+    if car.used_wet or len(car.used_dry_compounds) >= 2:
+        return True
+
+    last_safe_pit_lap = max(state.lap + 1, race_total_laps - deadline_laps)
+    if planned_lap is None:
+        planned_lap = min(
+            (
+                int(action["at_lap"])
+                for action in plan.actions
+                if str(action["action"]).startswith("PIT_TO_")
+            ),
+            default=None,
+        )
+    if planned_lap is None:
+        return (race_total_laps - state.lap) > deadline_laps
+
+    planned_compound = _planned_compound_from_actions(plan.actions)
+    if planned_compound is None:
+        return (race_total_laps - state.lap) > deadline_laps
+    if planned_compound in {TyreCompound.INTER.value, TyreCompound.WET.value}:
+        return True
+    if planned_compound in car.used_dry_compounds:
+        return False
+    return planned_lap <= last_safe_pit_lap
 
 
 def _reference_car(*, state: RaceState, target_driver: str, copy_policy: str) -> CarState | None:
@@ -797,6 +950,25 @@ def _tyre_compound_from_action(action: str) -> TyreCompound:
     return TyreCompound.UNKNOWN
 
 
+def _planned_compound_from_actions(actions: list[dict[str, int | str]]) -> str | None:
+    for action in actions:
+        action_name = str(action["action"])
+        if action_name.startswith("PIT_TO_"):
+            return action_name.removeprefix("PIT_TO_")
+    return None
+
+
+def _immediate_action_for_plan(
+    *,
+    current_lap: int,
+    actions: list[dict[str, int | str]],
+) -> str:
+    for action in actions:
+        if int(action["at_lap"]) == current_lap + 1:
+            return str(action["action"])
+    return "STAY_OUT"
+
+
 def _mean_component_totals(outcomes: list[SimulationOutcome]) -> dict[str, float]:
     if not outcomes:
         return {}
@@ -815,6 +987,7 @@ def _build_plan_diagnostics(
     plan_totals: list[float],
     baseline_totals: list[float],
     outcomes: list[SimulationOutcome],
+    baseline_outcomes: list[SimulationOutcome],
     deltas: list[float],
     horizon_laps: int,
     n_scenarios: int,
@@ -827,6 +1000,10 @@ def _build_plan_diagnostics(
     plan_total_time_ms = sum(plan_totals) / len(plan_totals)
     baseline_total_time_ms = sum(baseline_totals) / len(baseline_totals)
     pit_loss_ms_used = sum(outcome.pit_loss_ms_used for outcome in outcomes) / len(outcomes)
+    baseline_pit_loss_ms = sum(
+        outcome.pit_loss_ms_used for outcome in baseline_outcomes
+    ) / len(baseline_outcomes)
+    baseline_component_totals = _mean_component_totals(baseline_outcomes)
     per_lap_component_summary = {
         f"{component}_mean_ms": total / horizon_laps if horizon_laps else 0.0
         for component, total in component_totals.items()
@@ -841,6 +1018,9 @@ def _build_plan_diagnostics(
         "n_scenarios": n_scenarios,
         "seed": seed_note,
         "pit_loss_ms_used": pit_loss_ms_used,
+        "baseline_pit_loss_ms": baseline_pit_loss_ms,
+        "plan_component_totals_ms": dict(component_totals),
+        "baseline_component_totals_ms": dict(baseline_component_totals),
         "per_lap_time_components_summary_ms": per_lap_component_summary,
         "baseline_total_time_ms": baseline_total_time_ms,
         "plan_total_time_ms": plan_total_time_ms,
@@ -857,3 +1037,12 @@ def _build_plan_diagnostics(
         "p_gain_pos_ge_1": p_gain,
         "risk_sigma_ms": risk_sigma_ms,
     }
+
+
+def _build_plan_contributions(diagnostics: dict[str, object]) -> dict[str, float]:
+    return contribution_breakdown(
+        plan_pit_loss_ms=float(diagnostics.get("pit_loss_ms_used", 0.0)),
+        baseline_pit_loss_ms=float(diagnostics.get("baseline_pit_loss_ms", 0.0)),
+        plan_components_ms=dict(diagnostics.get("plan_component_totals_ms", {})),
+        baseline_components_ms=dict(diagnostics.get("baseline_component_totals_ms", {})),
+    )

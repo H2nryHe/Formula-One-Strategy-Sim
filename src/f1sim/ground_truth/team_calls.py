@@ -3,6 +3,8 @@
 Convention:
 - A pit lap is defined as the lap where `pit_in == True`.
 - `compound_after` is the next observed tyre compound for the driver after that pit-in lap.
+- `team_calls` is an event table: one row per pit event only.
+- Per-lap action labels default to `STAY_OUT`; `PIT` is set only on pit-event laps.
 """
 
 from __future__ import annotations
@@ -60,9 +62,9 @@ def extract_pit_calls(
         stint_by_lap = _derive_stint_ids(driver_rows)
         next_compounds = _next_compound_after_lap(driver_rows)
         for row in driver_rows:
-            if not row.get("pit_in"):
-                continue
             pit_lap = int(row["lap_number"])
+            if pit_lap <= 1 or not row.get("pit_in"):
+                continue
             pit_calls.append(
                 PitCall(
                     session_id=str(row["session_id"]),
@@ -116,6 +118,7 @@ def extract_lap_actions(state_or_tables: Any) -> dict[tuple[str, int], ActionLab
 def materialize_team_calls(*, db_path: str, session_id: str) -> dict[str, int]:
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
+        _ensure_team_calls_table(conn)
         laps = conn.execute(
             """
             SELECT *
@@ -152,8 +155,10 @@ def materialize_team_calls(*, db_path: str, session_id: str) -> dict[str, int]:
 
 
 def load_team_calls(*, db_path: str, session_id: str) -> list[PitCall]:
+    materialize_team_calls(db_path=db_path, session_id=session_id)
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
+        _ensure_team_calls_table(conn)
         rows = conn.execute(
             """
             SELECT *
@@ -163,9 +168,6 @@ def load_team_calls(*, db_path: str, session_id: str) -> list[PitCall]:
             """,
             (session_id,),
         ).fetchall()
-    if not rows:
-        materialize_team_calls(db_path=db_path, session_id=session_id)
-        return load_team_calls(db_path=db_path, session_id=session_id)
     return [
         PitCall(
             session_id=str(row["session_id"]),
@@ -275,6 +277,26 @@ def _normalize_state_or_rows(state_or_tables: Any) -> list[dict[str, Any]]:
                 )
         return rows
     return _normalize_rows(state_or_tables)
+
+
+def _ensure_team_calls_table(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS team_calls (
+            session_id TEXT NOT NULL,
+            driver_id TEXT NOT NULL,
+            lap INTEGER NOT NULL,
+            actual_action TEXT NOT NULL,
+            compound_before TEXT,
+            compound_after TEXT,
+            payload_json TEXT NOT NULL,
+            PRIMARY KEY (session_id, driver_id, lap)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_team_calls_session_driver
+            ON team_calls(session_id, driver_id, lap);
+        """
+    )
 
 
 def _normalize_rows(rows: Any) -> list[dict[str, Any]]:

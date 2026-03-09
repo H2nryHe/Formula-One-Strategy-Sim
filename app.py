@@ -9,6 +9,8 @@ import streamlit as st
 
 from f1sim.ui import (
     build_demo_payload,
+    build_key_moments,
+    build_race_situation_panel,
     build_timeline_rows,
     list_drivers,
     list_sessions,
@@ -50,6 +52,16 @@ def main() -> None:
         selected_driver = _render_driver_selector(db_path, session_info.session_id)
         seed = st.number_input("Seed", min_value=0, value=DEFAULT_SEED, step=1)
         lap = _render_lap_controls(session_info.session_id, state_max_lap)
+        key_moments = build_key_moments(
+            db_path=db_path,
+            session_id=session_info.session_id,
+            driver_id=selected_driver,
+            seed=int(seed),
+            top_k=DEFAULT_TOP_K,
+            horizon_laps=DEFAULT_HORIZON_LAPS,
+            n_scenarios=DEFAULT_N_SCENARIOS,
+        )
+        _render_key_moments(key_moments)
 
     race_state, recommendations = build_demo_payload(
         db_path=db_path,
@@ -60,6 +72,11 @@ def main() -> None:
         top_k=DEFAULT_TOP_K,
         horizon_laps=DEFAULT_HORIZON_LAPS,
         n_scenarios=DEFAULT_N_SCENARIOS,
+    )
+    situation_panel = build_race_situation_panel(
+        db_path=db_path,
+        session_id=session_info.session_id,
+        lap=lap,
     )
     timeline_rows = build_timeline_rows(
         db_path=db_path,
@@ -78,7 +95,7 @@ def main() -> None:
         st.metric("Top recommendation", recommendations.top_k[0].plan_id)
         st.metric("Scenario seed", int(seed))
 
-    top10_col, strategy_col = st.columns([1.15, 1.0], gap="large")
+    top10_col, strategy_col, situation_col = st.columns([1.0, 1.0, 0.9], gap="large")
     with top10_col:
         st.markdown("#### Top 10")
         st.dataframe(
@@ -88,6 +105,7 @@ def main() -> None:
         )
     with strategy_col:
         st.markdown("#### Strategy Panel")
+        _render_pred_vs_actual(recommendations)
         for idx, plan in enumerate(recommendations.top_k, start=1):
             with st.container(border=True):
                 st.markdown(f"**#{idx} {plan.plan_id}**")
@@ -111,6 +129,23 @@ def main() -> None:
                         f"`{explanation.code}` {explanation.text} "
                         f"({_short_evidence(explanation.evidence)})"
                     )
+                if plan.contributions:
+                    st.caption("Contributions vs STAY_OUT")
+                    st.dataframe(
+                        pd.DataFrame(
+                            [
+                                {"component": key, "delta_ms": value}
+                                for key, value in plan.contributions.items()
+                            ]
+                        ),
+                        width="stretch",
+                        hide_index=True,
+                    )
+    with situation_col:
+        st.markdown("#### Race-wide Situation")
+        _render_situation_list("Undercut window candidates", situation_panel["undercut_candidates"])
+        _render_situation_list("Tyre risk ranking", situation_panel["tyre_risk_ranking"])
+        _render_situation_list("Traffic hotspots", situation_panel["traffic_hotspots"])
 
     st.markdown("#### Timeline")
     st.dataframe(
@@ -180,7 +215,11 @@ def _render_lap_controls(session_id: str, max_lap: int) -> int:
 
 
 def _top10_rows(race_state: Any) -> list[dict[str, object]]:
-    cars = sorted(race_state.cars.values(), key=lambda car: car.position)[:10]
+    cars = [
+        car
+        for car in sorted(race_state.cars.values(), key=lambda car: (car.position, car.driver_id))
+        if 1 <= int(car.position) < 900
+    ][:10]
     return [
         {
             "position": car.position,
@@ -207,6 +246,45 @@ def _format_pair(first: float, second: float) -> str:
 def _short_evidence(evidence: dict[str, object]) -> str:
     parts = [f"{key}={value}" for key, value in evidence.items()]
     return ", ".join(parts[:3])
+
+
+def _render_pred_vs_actual(recommendations: Any) -> None:
+    st.caption("Pred vs Actual")
+    ground_truth = recommendations.ground_truth
+    actual_cols = st.columns(2)
+    actual_cols[0].metric("Actual action", str(ground_truth.get("actual_action", "-")))
+    actual_cols[1].metric(
+        "Actual compound after",
+        str(ground_truth.get("actual_compound_after") or "-"),
+    )
+    pit_timeline = ground_truth.get("pit_timeline", [])
+    st.write(
+        "Pit timeline:",
+        ", ".join(
+            f"L{item['lap']} {item['compound_before']}->{item['compound_after']}"
+            for item in pit_timeline
+        )
+        or "none",
+    )
+
+
+def _render_situation_list(title: str, rows: list[dict[str, object]]) -> None:
+    st.caption(title)
+    if not rows:
+        st.write("No items")
+        return
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+
+def _render_key_moments(key_moments: tuple[dict[str, object], ...]) -> None:
+    st.caption("Key moments")
+    if not key_moments:
+        st.write("No jump targets")
+        return
+    for moment in key_moments:
+        label = f"Lap {moment['lap']}: {moment['summary']}"
+        if st.button(label, width="stretch", key=f"jump_{moment['lap']}"):
+            st.session_state.demo_lap = int(moment["lap"])
 
 
 if __name__ == "__main__":

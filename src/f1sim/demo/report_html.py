@@ -77,6 +77,7 @@ def _render_kv_table(payload: dict[str, object]) -> str:
 def _render_plan(plan: dict[str, object]) -> str:
     metrics = plan.get("metrics", {})
     diagnostics = plan.get("diagnostics", {})
+    contributions = plan.get("contributions", {})
     actions = plan.get("actions", [])
     explanations = plan.get("explanations", [])
     counterfactuals = plan.get("counterfactuals", {})
@@ -154,6 +155,9 @@ def _render_plan(plan: dict[str, object]) -> str:
     component_summary_html = _render_kv_table(
         component_summary if isinstance(component_summary, dict) else {}
     )
+    contributions_html = _render_kv_table(
+        contributions if isinstance(contributions, dict) else {}
+    )
 
     return (
         "<div class='plan-card'>"
@@ -165,6 +169,9 @@ def _render_plan(plan: dict[str, object]) -> str:
         f"{diagnostics_html}"
         "<h5>Per-Lap Component Summary</h5>"
         f"{component_summary_html}"
+        "</div>"
+        "<div class='subsection'><h5>Contributions vs STAY_OUT</h5>"
+        f"{contributions_html}"
         "</div>"
         "<div class='subsection'><h5>Explanations</h5>"
         f"{explanations_html}"
@@ -187,8 +194,8 @@ def _render_driver_section(driver_id: str, rows: list[dict[str, object]]) -> str
         ground_truth = bundle.get("ground_truth", {})
         top_k = bundle.get("top_k", [])
         top_plan = top_k[0] if top_k else {}
-        top_actions = top_plan.get("actions", [])
-        predicted_action = top_actions[0]["action"] if top_actions else "STAY_OUT"
+        diagnostics = top_plan.get("diagnostics", {})
+        predicted_action = diagnostics.get("immediate_action", "STAY_OUT")
         predicted_compound = (
             predicted_action.replace("PIT_TO_", "")
             if predicted_action.startswith("PIT_TO_")
@@ -296,6 +303,9 @@ def render_html(artifact_dir: Path) -> str:
     delta_time_config = config.get("delta_time", {})
     if not isinstance(delta_time_config, dict):
         delta_time_config = {}
+    topk_overall = behavioral.get("topk_action_coverage", {}).get("overall", {})
+    pm1_overall = behavioral.get("pit_window_hit_rate", {}).get("pm1", {}).get("overall", {})
+    pm2_overall = behavioral.get("pit_window_hit_rate", {}).get("pm2", {}).get("overall", {})
 
     header_cards = [
         ("Session", config.get("session_id", "-")),
@@ -311,6 +321,51 @@ def render_html(artifact_dir: Path) -> str:
         f"<div class='value'>{html.escape(str(value))}</div>"
         "</div>"
         for label, value in header_cards
+    )
+    metrics_rows = [
+        (
+            "Top-1 action accuracy",
+            _fmt_number(behavioral.get("top1_action_accuracy"), 3),
+            behavioral.get("top1_action_accuracy_n", "-"),
+        ),
+        (
+            "Top-K coverage (K=3)",
+            _fmt_number(topk_overall.get("value"), 3),
+            topk_overall.get("n", "-"),
+        ),
+        (
+            "Window hit ±1",
+            _fmt_number(pm1_overall.get("value"), 3),
+            pm1_overall.get("n", "-"),
+        ),
+        (
+            "Window hit ±2",
+            _fmt_number(pm2_overall.get("value"), 3),
+            pm2_overall.get("n", "-"),
+        ),
+        (
+            "Compound accuracy on PIT laps",
+            _fmt_number(behavioral.get("pit_compound_accuracy"), 3),
+            behavioral.get("pit_compound_accuracy_n", "-"),
+        ),
+        (
+            "Rule violation rate",
+            _fmt_number(decision_quality.get("rule_violation_rate"), 3),
+            decision_quality.get("bundles_evaluated", "-"),
+        ),
+    ]
+    metrics_table = (
+        "<table class='data-table'>"
+        "<thead><tr><th>Metric</th><th>Value</th><th>n</th></tr></thead><tbody>"
+        + "".join(
+            (
+                f"<tr><td>{html.escape(str(name))}</td>"
+                f"<td>{html.escape(str(value))}</td>"
+                f"<td>{html.escape(str(count))}</td></tr>"
+            )
+            for name, value, count in metrics_rows
+        )
+        + "</tbody></table>"
     )
 
     session_table = _render_kv_table(
@@ -336,6 +391,14 @@ def render_html(artifact_dir: Path) -> str:
         str(delta_time_config.get("interpretation", DELTA_TIME_DEFINITION_LABEL))
     )
     units_text = html.escape(str(delta_time_config.get("units", "ms")))
+    assumptions_text = html.escape(str(config.get("assumptions_hash", "-")))
+    model_versions_text = html.escape(
+        json.dumps(config.get("model_versions", {}), sort_keys=True)
+    )
+    seed_text = html.escape(str(config.get("seed", "-")))
+    horizon_text = html.escape(str(config.get("horizon_laps", "-")))
+    top_k_text = html.escape(str(config.get("top_k", "-")))
+    scenario_text = html.escape(str(config.get("n_scenarios", "-")))
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -379,6 +442,15 @@ def render_html(artifact_dir: Path) -> str:
       grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
       gap: 12px;
       margin-top: 18px;
+    }}
+    .hero-meta {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 8px 16px;
+      margin-top: 18px;
+    }}
+    .hero-meta p {{
+      margin: 0;
     }}
     .stat-card, .plan-card, .subsection, .driver-section {{
       background: var(--panel);
@@ -537,6 +609,14 @@ def render_html(artifact_dir: Path) -> str:
         and full top-K explanation blocks.
       </p>
       <div class="stats">{card_html}</div>
+      <div class="hero-meta">
+        <p><strong>assumptions_hash:</strong> <code>{assumptions_text}</code></p>
+        <p><strong>model_versions:</strong> <code>{model_versions_text}</code></p>
+        <p><strong>seed:</strong> {seed_text}</p>
+        <p><strong>horizon:</strong> {horizon_text}</p>
+        <p><strong>top_k:</strong> {top_k_text}</p>
+        <p><strong>n_scenarios:</strong> {scenario_text}</p>
+      </div>
     </section>
     <section class="definition-box">
       <h2>Δtime Definition</h2>
@@ -553,6 +633,10 @@ def render_html(artifact_dir: Path) -> str:
         <h2>Session Summary</h2>
         {session_table}
       </div>
+    </section>
+    <section class="subsection">
+      <h2>Behavioral Summary</h2>
+      {metrics_table}
     </section>
     {"".join(driver_sections)}
   </main>

@@ -69,6 +69,7 @@ class Plan:
     metrics: PlanMetrics
     explanations: list[Explanation] = field(default_factory=list)
     counterfactuals: dict[str, dict[str, float | str]] = field(default_factory=dict)
+    contributions: dict[str, float] = field(default_factory=dict)
     diagnostics: dict[str, object] = field(default_factory=dict)
     is_suspicious: bool = False
     suspicion_reason: str | None = None
