@@ -19,6 +19,12 @@ from f1sim.contracts import (
 from f1sim.eval.metrics import quantile
 from f1sim.explainer import build_plan_counterfactuals, build_plan_explanations
 from f1sim.features import FEATURE_SCHEMA_VERSION
+from f1sim.metrics import (
+    accumulate_plan_total_time,
+    compute_delta_time,
+    delta_time_cap_ms,
+    suspicion_reason_for_delta_time,
+)
 from f1sim.models import (
     DegradationModelV0,
     PaceModelV0,
@@ -65,6 +71,7 @@ class RolloutSearchConfig:
     copy_policy: str = "nearest"
     top_k: int = 3
     two_dry_deadline_laps: int = 12
+    sanity_delta_time_per_lap_cap_ms: float = 6000.0
     rule_thresholds: dict[str, int] | None = None
 
     def resolved_thresholds(self) -> dict[str, int]:
@@ -78,6 +85,9 @@ class RolloutSearchConfig:
 class SimulationOutcome:
     total_time_ms: float
     final_position: int
+    pit_loss_ms_used: float
+    per_lap_times_ms: list[float]
+    pace_component_totals_ms: dict[str, float]
 
 
 def build_model_suite(rule_thresholds: dict[str, int] | None = None) -> ModelSuite:
@@ -206,6 +216,7 @@ class RolloutStrategySearcher:
                 action=action,
                 outcomes=outcomes,
                 baseline_outcomes=stay_out_outcomes,
+                seed=seed,
             )
             for action, outcomes in action_outcomes.items()
         }
@@ -297,10 +308,19 @@ class RolloutStrategySearcher:
         for scenario_index, scenario in enumerate(scenarios):
             rng = random.Random(seed + scenario_index * 10007 + sum(map(ord, target_driver)))
             sim_state = _clone_state(state)
-            cumulative_times = {
+            cumulative_race_times = {
                 driver_id: float(car.gap_to_leader_ms or 0.0)
                 for driver_id, car in sim_state.cars.items()
             }
+            target_per_lap_times_ms: list[float] = []
+            target_pace_component_totals_ms = {
+                "base": 0.0,
+                "degradation": 0.0,
+                "track_status": 0.0,
+                "traffic": 0.0,
+                "weather": 0.0,
+            }
+            target_pit_loss_ms = 0.0
             has_pitted = {driver_id: False for driver_id in sim_state.cars}
             pace_cache: dict[tuple[Any, ...], Any] = {}
             pit_cache: dict[tuple[Any, ...], Any] = {}
@@ -332,23 +352,49 @@ class RolloutStrategySearcher:
                         has_pitted[driver_id] = True
 
                 lap_times: dict[str, float] = {}
+                raw_pace_lap_times: dict[str, float] = {}
                 for driver_id, current_action in planned_actions.items():
-                    lap_times[driver_id] = self._simulate_driver_lap(
+                    lap_time_ms, lap_diagnostics = self._simulate_driver_lap(
                         sim_state=sim_state,
                         driver_id=driver_id,
                         action=current_action,
                         pace_cache=pace_cache,
                     )
-                    cumulative_times[driver_id] += lap_times[driver_id]
+                    lap_times[driver_id] = lap_time_ms
+                    raw_pace_lap_times[driver_id] = float(lap_diagnostics["pace_lap_time_ms"])
+                    cumulative_race_times[driver_id] += lap_time_ms
+                    if driver_id == target_driver:
+                        target_per_lap_times_ms.append(
+                            float(lap_diagnostics["pace_lap_time_ms"])
+                        )
+                        target_pit_loss_ms += float(lap_diagnostics["pit_loss_ms_used"])
+                        for component, value in lap_diagnostics["pace_components_ms"].items():
+                            target_pace_component_totals_ms[component] += float(value)
                     if current_action != "STAY_OUT" and driver_id == target_driver:
                         has_pitted[driver_id] = True
 
-                self._update_running_order(sim_state, cumulative_times, lap_times)
+                self._update_running_order(
+                    sim_state,
+                    cumulative_race_times,
+                    lap_times,
+                    raw_pace_lap_times,
+                )
+
+            total_time_ms = accumulate_plan_total_time(
+                target_per_lap_times_ms,
+                pit_loss_ms=target_pit_loss_ms,
+            )
+            expected_total_time_ms = sum(target_per_lap_times_ms) + target_pit_loss_ms
+            if not math.isclose(total_time_ms, expected_total_time_ms, rel_tol=0.0, abs_tol=1e-6):
+                raise ValueError("target horizon total does not match per-lap accumulation")
 
             outcomes.append(
                 SimulationOutcome(
-                    total_time_ms=cumulative_times[target_driver],
+                    total_time_ms=total_time_ms,
                     final_position=sim_state.cars[target_driver].position,
+                    pit_loss_ms_used=target_pit_loss_ms,
+                    per_lap_times_ms=target_per_lap_times_ms,
+                    pace_component_totals_ms=target_pace_component_totals_ms,
                 )
             )
         return outcomes
@@ -395,7 +441,7 @@ class RolloutStrategySearcher:
         driver_id: str,
         action: str,
         pace_cache: dict[tuple[Any, ...], Any],
-    ) -> float:
+    ) -> tuple[float, dict[str, object]]:
         car = sim_state.cars[driver_id]
         pit_penalty = 0.0
         is_outlap = False
@@ -428,13 +474,18 @@ class RolloutStrategySearcher:
             recent = list(car.recent_lap_times_ms)
             recent.append(prediction.mean_ms)
             car.recent_lap_times_ms = recent[-5:]
-        return lap_time
+        return lap_time, {
+            "pace_lap_time_ms": prediction.mean_ms,
+            "pit_loss_ms_used": pit_penalty,
+            "pace_components_ms": dict(prediction.components),
+        }
 
     def _update_running_order(
         self,
         sim_state: RaceState,
         cumulative_times: dict[str, float],
         lap_times: dict[str, float],
+        raw_pace_lap_times: dict[str, float],
     ) -> None:
         ordered = sorted(cumulative_times.items(), key=lambda item: (item[1], item[0]))
         leader_time = ordered[0][1]
@@ -446,7 +497,7 @@ class RolloutStrategySearcher:
             car.interval_ahead_ms = 0.0 if previous_time is None else total_time - previous_time
             previous_time = total_time
             car.interval_behind_ms = None
-            car.last_lap_time_ms = lap_times[driver_id]
+            car.last_lap_time_ms = raw_pace_lap_times[driver_id]
             car.is_pitting = False
             car.pit_in = False
 
@@ -463,9 +514,10 @@ class RolloutStrategySearcher:
         action: str,
         outcomes: list[SimulationOutcome],
         baseline_outcomes: list[SimulationOutcome],
+        seed: int,
     ) -> Plan:
         deltas = [
-            baseline.total_time_ms - outcome.total_time_ms
+            compute_delta_time(outcome.total_time_ms, baseline.total_time_ms)
             for baseline, outcome in zip(baseline_outcomes, outcomes, strict=True)
         ]
         initial_position = state.cars[target_driver].position
@@ -474,6 +526,23 @@ class RolloutStrategySearcher:
         ) / len(outcomes)
         mean_delta = sum(deltas) / len(deltas)
         sigma = _distribution_sigma(deltas)
+        plan_totals = [outcome.total_time_ms for outcome in outcomes]
+        baseline_totals = [outcome.total_time_ms for outcome in baseline_outcomes]
+        horizon_laps = len(outcomes[0].per_lap_times_ms) if outcomes else 0
+        component_totals = _mean_component_totals(outcomes)
+        diagnostics = _build_plan_diagnostics(
+            plan_totals=plan_totals,
+            baseline_totals=baseline_totals,
+            outcomes=outcomes,
+            deltas=deltas,
+            horizon_laps=horizon_laps,
+            n_scenarios=len(outcomes),
+            seed_note=str(seed),
+            delta_time_per_lap_cap_ms=self.config.sanity_delta_time_per_lap_cap_ms,
+            p_gain=p_gain,
+            risk_sigma_ms=sigma,
+            component_totals=component_totals,
+        )
         return Plan(
             plan_id=plan_id,
             actions=_plan_actions(state.lap, action),
@@ -487,6 +556,13 @@ class RolloutStrategySearcher:
             ),
             explanations=[],
             counterfactuals={},
+            diagnostics=diagnostics,
+            is_suspicious=bool(diagnostics["is_suspicious"]),
+            suspicion_reason=(
+                str(diagnostics["suspicion_reason"])
+                if diagnostics["suspicion_reason"] is not None
+                else None
+            ),
         )
 
     @staticmethod
@@ -560,6 +636,9 @@ def _plan_to_dict(plan: Plan) -> dict[str, Any]:
         "metrics": asdict(plan.metrics),
         "explanations": [asdict(explanation) for explanation in plan.explanations],
         "counterfactuals": dict(plan.counterfactuals),
+        "diagnostics": dict(plan.diagnostics),
+        "is_suspicious": plan.is_suspicious,
+        "suspicion_reason": plan.suspicion_reason,
     }
 
 
@@ -663,11 +742,11 @@ def _distribution_sigma(values: list[float]) -> float:
 
 
 def _plan_comparison(best_plan: Plan, baseline_plan: Plan) -> PlanComparison:
+    best_total = float(best_plan.diagnostics.get("plan_total_time_ms", 0.0))
+    baseline_total = float(baseline_plan.diagnostics.get("plan_total_time_ms", 0.0))
     return PlanComparison(
         baseline_plan_id=baseline_plan.plan_id,
-        delta_time_mean_ms=(
-            best_plan.metrics.delta_time_mean_ms - baseline_plan.metrics.delta_time_mean_ms
-        ),
+        delta_time_mean_ms=compute_delta_time(best_total, baseline_total),
         notes="Positive means the selected plan is estimated to outperform the baseline.",
     )
 
@@ -716,3 +795,65 @@ def _tyre_compound_from_action(action: str) -> TyreCompound:
         if compound.value == suffix:
             return compound
     return TyreCompound.UNKNOWN
+
+
+def _mean_component_totals(outcomes: list[SimulationOutcome]) -> dict[str, float]:
+    if not outcomes:
+        return {}
+    totals: dict[str, float] = {}
+    for outcome in outcomes:
+        for component, value in outcome.pace_component_totals_ms.items():
+            totals[component] = totals.get(component, 0.0) + value
+    return {
+        component: total / len(outcomes)
+        for component, total in totals.items()
+    }
+
+
+def _build_plan_diagnostics(
+    *,
+    plan_totals: list[float],
+    baseline_totals: list[float],
+    outcomes: list[SimulationOutcome],
+    deltas: list[float],
+    horizon_laps: int,
+    n_scenarios: int,
+    seed_note: str,
+    delta_time_per_lap_cap_ms: float,
+    p_gain: float,
+    risk_sigma_ms: float,
+    component_totals: dict[str, float],
+) -> dict[str, object]:
+    plan_total_time_ms = sum(plan_totals) / len(plan_totals)
+    baseline_total_time_ms = sum(baseline_totals) / len(baseline_totals)
+    pit_loss_ms_used = sum(outcome.pit_loss_ms_used for outcome in outcomes) / len(outcomes)
+    per_lap_component_summary = {
+        f"{component}_mean_ms": total / horizon_laps if horizon_laps else 0.0
+        for component, total in component_totals.items()
+    }
+    suspicion_reason = suspicion_reason_for_delta_time(
+        delta_time_ms=sum(deltas) / len(deltas),
+        horizon_laps=max(horizon_laps, 1),
+        delta_time_per_lap_cap_ms=delta_time_per_lap_cap_ms,
+    )
+    return {
+        "horizon_laps": horizon_laps,
+        "n_scenarios": n_scenarios,
+        "seed": seed_note,
+        "pit_loss_ms_used": pit_loss_ms_used,
+        "per_lap_time_components_summary_ms": per_lap_component_summary,
+        "baseline_total_time_ms": baseline_total_time_ms,
+        "plan_total_time_ms": plan_total_time_ms,
+        "plan_total_time_p10_ms": quantile(plan_totals, 0.10) or plan_total_time_ms,
+        "plan_total_time_p50_ms": quantile(plan_totals, 0.50) or plan_total_time_ms,
+        "plan_total_time_p90_ms": quantile(plan_totals, 0.90) or plan_total_time_ms,
+        "baseline_total_time_p50_ms": quantile(baseline_totals, 0.50) or baseline_total_time_ms,
+        "delta_time_cap_ms": delta_time_cap_ms(
+            horizon_laps=max(horizon_laps, 1),
+            delta_time_per_lap_cap_ms=delta_time_per_lap_cap_ms,
+        ),
+        "is_suspicious": suspicion_reason is not None,
+        "suspicion_reason": suspicion_reason,
+        "p_gain_pos_ge_1": p_gain,
+        "risk_sigma_ms": risk_sigma_ms,
+    }

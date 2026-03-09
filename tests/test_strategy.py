@@ -36,6 +36,9 @@ def test_rollout_search_returns_valid_top_k_bundle() -> None:
     assert set(bundle.baselines) == {"STAY_OUT", "RULE_TYRE_AGE", "COPY_NEAREST"}
     assert baselines["STAY_OUT"].plan_id == "STAY_OUT"
     assert all(len(plan.explanations) >= 2 for plan in bundle.top_k)
+    assert "plan_total_time_ms" in bundle.top_k[0].diagnostics
+    assert "baseline_total_time_ms" in bundle.top_k[0].diagnostics
+    assert "pit_loss_ms_used" in bundle.top_k[0].diagnostics
 
 
 def test_rollout_search_is_deterministic_for_same_seed() -> None:
@@ -86,6 +89,8 @@ def test_recommend_cli_outputs_bundle_json(tmp_path) -> None:
     assert len(payload["top_k"]) == 3
     assert payload["model_versions"]["search"] == "rollout_search_v0.3"
     assert payload["ground_truth"]["actual_action"] in {"STAY_OUT", "PIT"}
+    assert "diagnostics" in payload["top_k"][0]
+    assert "plan_total_time_ms" in payload["top_k"][0]["diagnostics"]
 
 
 def test_rollout_search_enforces_two_dry_rule_deadline() -> None:

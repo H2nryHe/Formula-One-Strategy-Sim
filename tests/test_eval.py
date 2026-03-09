@@ -317,12 +317,15 @@ def test_run_session_evaluation_returns_stable_schema(tmp_path) -> None:
     assert report.model_versions["pace"] == "pace_v0.1"
     assert report.model_versions["pit_policy"] == "pit_policy_v0.1"
     assert report.model_versions["scenario"] == "scenario_v0.1"
+    assert report.config["delta_time"]["formula"] == "baseline_total_time_ms - plan_total_time_ms"
     assert report.bundles
     first_bundle = report.bundles[0]["recommendation_bundle"]
     assert first_bundle["top_k"]
     assert "baselines" in first_bundle
     assert "ground_truth" in first_bundle
     assert first_bundle["model_versions"]["search"] == "rollout_search_v0.2"
+    assert "diagnostics" in first_bundle["top_k"][0]
+    assert "plan_total_time_ms" in first_bundle["top_k"][0]["diagnostics"]
     assert report.ground_truth_summary["pits_per_driver"]
 
 
@@ -348,7 +351,9 @@ def test_write_evaluation_outputs_creates_json_and_markdown(tmp_path) -> None:
     assert "decision_quality" in json_payload
     assert "ground_truth_summary" in json_payload
     assert json_payload["decision_quality"]["rule_violation_rate"] == 0.0
+    assert json_payload["config"]["delta_time"]["units"] == "ms"
     assert "Layer 1 Behavioral" in markdown
+    assert "## Δtime Definition" in markdown
     assert "COPY_LEADER" in markdown
     assert "Rule violation rate=0.000" in markdown
     assert "Pred vs Actual Sample" in markdown

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from f1sim.contracts import Explanation, Plan
+from f1sim.metrics import compute_delta_time
 from f1sim.rules import compounds_used_count, is_two_dry_required
 from f1sim.state import RaceState, TrackStatus
 
@@ -168,13 +169,17 @@ def build_plan_counterfactuals(
 
 
 def _compare_plans(plan: Plan, reference: Plan) -> dict[str, float | str]:
+    plan_total = float(plan.diagnostics.get("plan_total_time_ms", 0.0))
+    reference_total = float(reference.diagnostics.get("plan_total_time_ms", 0.0))
+    plan_p50 = float(plan.diagnostics.get("plan_total_time_p50_ms", plan_total))
+    reference_p50 = float(
+        reference.diagnostics.get("plan_total_time_p50_ms", reference_total)
+    )
     return {
         "reference_plan_id": reference.plan_id,
         "reference_action": _plan_action(reference),
-        "delta_time_mean_ms": (
-            plan.metrics.delta_time_mean_ms - reference.metrics.delta_time_mean_ms
-        ),
-        "delta_time_p50_ms": plan.metrics.delta_time_p50_ms - reference.metrics.delta_time_p50_ms,
+        "delta_time_mean_ms": compute_delta_time(plan_total, reference_total),
+        "delta_time_p50_ms": compute_delta_time(plan_p50, reference_p50),
     }
 
 

@@ -28,6 +28,14 @@ from f1sim.ground_truth import (
     extract_pit_calls,
     summarize_team_calls,
 )
+from f1sim.metrics import (
+    DELTA_TIME_DEFINITION_LABEL,
+    DELTA_TIME_FORMULA,
+    accumulate_plan_total_time,
+    compute_delta_time,
+    delta_time_cap_ms,
+    suspicion_reason_for_delta_time,
+)
 from f1sim.models import (
     DegradationModelV0,
     PaceModelV0,
@@ -93,6 +101,14 @@ class EvaluationReport:
         return asdict(self)
 
 
+@dataclass(slots=True)
+class ActionSimulationOutcome:
+    total_time_ms: float
+    pit_loss_ms_used: float
+    per_lap_times_ms: list[float]
+    pace_component_totals_ms: dict[str, float]
+
+
 def run_session_evaluation(
     *,
     session_id: str,
@@ -143,6 +159,11 @@ def run_session_evaluation(
             "copy_policy": copy_policy,
             "seed": seed,
             "n_scenarios": n_scenarios,
+            "delta_time": {
+                "formula": DELTA_TIME_FORMULA,
+                "interpretation": DELTA_TIME_DEFINITION_LABEL,
+                "units": "ms",
+            },
             "rule_thresholds": thresholds,
             "rules": {"two_dry_deadline_laps": TWO_DRY_DEADLINE_LAPS},
         },
@@ -565,7 +586,7 @@ def _build_bundle_for_driver(
     if not rule_mask.get(actions["HEURISTIC_SEARCH"], True):
         actions["HEURISTIC_SEARCH"] = _first_allowed_action(rule_mask)
 
-    plan_payloads: dict[str, tuple[Plan, list[float]]] = {}
+    plan_payloads: dict[str, tuple[Plan, list[ActionSimulationOutcome]]] = {}
     stay_out_distribution = baseline_distributions["STAY_OUT"]
     for plan_id, action in actions.items():
         if plan_id == "STAY_OUT":
@@ -587,6 +608,8 @@ def _build_bundle_for_driver(
             baseline_distribution=stay_out_distribution,
             suite=suite,
             race_total_laps=race_total_laps,
+            seed=seed,
+            n_scenarios=n_scenarios,
         )
         plan_payloads[plan_id] = (plan, distribution)
 
@@ -681,12 +704,20 @@ def _simulate_action_distribution(
     action: str,
     suite: ModelSuite,
     scenarios: list[Any],
-) -> list[float]:
-    costs: list[float] = []
+) -> list[ActionSimulationOutcome]:
+    outcomes: list[ActionSimulationOutcome] = []
     for scenario in scenarios:
         sim_state = _clone_state(state)
         car = sim_state.cars[driver_id]
-        total_cost = 0.0
+        per_lap_times_ms: list[float] = []
+        pit_loss_ms_used = 0.0
+        component_totals_ms = {
+            "base": 0.0,
+            "degradation": 0.0,
+            "track_status": 0.0,
+            "traffic": 0.0,
+            "weather": 0.0,
+        }
         pitted = action != "STAY_OUT"
         for step, status_name in enumerate(scenario.track_status_path, start=1):
             sim_state.lap = state.lap + step - 1
@@ -696,7 +727,7 @@ def _simulate_action_distribution(
                 car.tyre_compound = _tyre_compound_from_action(action)
                 car.tyre_age_laps = 0
                 car.pit_out = True
-                total_cost += _pit_loss_ms(sim_state.track_status) + 2500.0
+                pit_loss_ms_used += _pit_loss_ms(sim_state.track_status) + 2500.0
             else:
                 car.tyre_age_laps += 1
                 car.pit_out = False
@@ -706,14 +737,30 @@ def _simulate_action_distribution(
                 is_outlap=pitted and step == 1,
             )
             prediction = suite.pace_model.predict_lap_time(sim_state, driver_id)
-            total_cost += prediction.mean_ms
+            per_lap_times_ms.append(prediction.mean_ms)
+            for component, value in prediction.components.items():
+                component_totals_ms[component] += float(value)
             car.last_lap_time_ms = prediction.mean_ms
             if not car.cleaning_flags.is_sc_vsc and not car.cleaning_flags.is_outlap:
                 recent = list(car.recent_lap_times_ms)
                 recent.append(prediction.mean_ms)
                 car.recent_lap_times_ms = recent[-5:]
-        costs.append(total_cost)
-    return costs
+        total_time_ms = accumulate_plan_total_time(
+            per_lap_times_ms,
+            pit_loss_ms=pit_loss_ms_used,
+        )
+        expected_total_time_ms = sum(per_lap_times_ms) + pit_loss_ms_used
+        if not math.isclose(total_time_ms, expected_total_time_ms, rel_tol=0.0, abs_tol=1e-6):
+            raise ValueError("distribution total time does not match per-lap accumulation")
+        outcomes.append(
+            ActionSimulationOutcome(
+                total_time_ms=total_time_ms,
+                pit_loss_ms_used=pit_loss_ms_used,
+                per_lap_times_ms=per_lap_times_ms,
+                pace_component_totals_ms=component_totals_ms,
+            )
+        )
+    return outcomes
 
 
 def _plan_from_distribution(
@@ -722,21 +769,39 @@ def _plan_from_distribution(
     driver_id: str,
     plan_id: str,
     action: str,
-    distribution: list[float],
-    baseline_distribution: list[float],
+    distribution: list[ActionSimulationOutcome],
+    baseline_distribution: list[ActionSimulationOutcome],
     suite: ModelSuite,
     race_total_laps: int,
+    seed: int,
+    n_scenarios: int,
 ) -> Plan:
+    plan_totals = [outcome.total_time_ms for outcome in distribution]
+    baseline_totals = [outcome.total_time_ms for outcome in baseline_distribution]
     deltas = [
-        baseline - plan
-        for baseline, plan in zip(baseline_distribution, distribution, strict=True)
+        compute_delta_time(plan, baseline)
+        for baseline, plan in zip(baseline_totals, plan_totals, strict=True)
     ]
     mean_delta = sum(deltas) / len(deltas)
     sigma = _distribution_sigma(deltas)
+    plan_total_time_ms = sum(plan_totals) / len(plan_totals)
+    baseline_total_time_ms = sum(baseline_totals) / len(baseline_totals)
+    plan_total_time_p50_ms = quantile(plan_totals, 0.50) or plan_total_time_ms
+    baseline_total_time_p50_ms = quantile(baseline_totals, 0.50) or baseline_total_time_ms
+    horizon_laps = len(distribution[0].per_lap_times_ms) if distribution else 0
+    pit_loss_ms_used = sum(outcome.pit_loss_ms_used for outcome in distribution) / len(distribution)
+    component_totals = _mean_component_totals(distribution)
+    suspicion_reason = suspicion_reason_for_delta_time(
+        delta_time_ms=mean_delta,
+        horizon_laps=max(horizon_laps, 1),
+    )
     counterfactuals = {
         "vs_STAY_OUT": {
             "delta_time_mean_ms": mean_delta,
-            "delta_time_p50_ms": quantile(deltas, 0.50) or mean_delta,
+            "delta_time_p50_ms": compute_delta_time(
+                plan_total_time_p50_ms,
+                baseline_total_time_p50_ms,
+            ),
         }
     }
     return Plan(
@@ -759,6 +824,27 @@ def _plan_from_distribution(
             race_total_laps=race_total_laps,
         ),
         counterfactuals=counterfactuals,
+        diagnostics={
+            "horizon_laps": horizon_laps,
+            "n_scenarios": n_scenarios,
+            "seed": seed,
+            "pit_loss_ms_used": pit_loss_ms_used,
+            "per_lap_time_components_summary_ms": {
+                f"{component}_mean_ms": total / horizon_laps if horizon_laps else 0.0
+                for component, total in component_totals.items()
+            },
+            "baseline_total_time_ms": baseline_total_time_ms,
+            "plan_total_time_ms": plan_total_time_ms,
+            "plan_total_time_p10_ms": quantile(plan_totals, 0.10) or plan_total_time_ms,
+            "plan_total_time_p50_ms": plan_total_time_p50_ms,
+            "plan_total_time_p90_ms": quantile(plan_totals, 0.90) or plan_total_time_ms,
+            "baseline_total_time_p50_ms": baseline_total_time_p50_ms,
+            "delta_time_cap_ms": delta_time_cap_ms(horizon_laps=max(horizon_laps, 1)),
+            "is_suspicious": suspicion_reason is not None,
+            "suspicion_reason": suspicion_reason,
+        },
+        is_suspicious=suspicion_reason is not None,
+        suspicion_reason=suspicion_reason,
     )
 
 
@@ -825,11 +911,11 @@ def _plan_explanations(
 
 
 def _plan_comparison(best_plan: Plan, baseline_plan: Plan) -> PlanComparison:
+    best_total = float(best_plan.diagnostics.get("plan_total_time_ms", 0.0))
+    baseline_total = float(baseline_plan.diagnostics.get("plan_total_time_ms", 0.0))
     return PlanComparison(
         baseline_plan_id=baseline_plan.plan_id,
-        delta_time_mean_ms=(
-            best_plan.metrics.delta_time_mean_ms - baseline_plan.metrics.delta_time_mean_ms
-        ),
+        delta_time_mean_ms=compute_delta_time(best_total, baseline_total),
         notes="Positive means the selected plan is estimated to outperform the baseline.",
     )
 
@@ -851,6 +937,19 @@ def _distribution_sigma(values: list[float]) -> float:
     mean_value = sum(values) / len(values)
     variance = sum((value - mean_value) ** 2 for value in values) / len(values)
     return math.sqrt(variance)
+
+
+def _mean_component_totals(outcomes: list[ActionSimulationOutcome]) -> dict[str, float]:
+    if not outcomes:
+        return {}
+    totals: dict[str, float] = {}
+    for outcome in outcomes:
+        for component, value in outcome.pace_component_totals_ms.items():
+            totals[component] = totals.get(component, 0.0) + value
+    return {
+        component: total / len(outcomes)
+        for component, total in totals.items()
+    }
 
 
 def _scenario_seed(*, state: RaceState, driver_id: str, base_seed: int) -> int:
@@ -990,6 +1089,9 @@ def _serialize_plan(plan: Plan) -> dict[str, Any]:
             for explanation in plan.explanations
         ],
         "counterfactuals": dict(plan.counterfactuals),
+        "diagnostics": dict(plan.diagnostics),
+        "is_suspicious": plan.is_suspicious,
+        "suspicion_reason": plan.suspicion_reason,
     }
 
 
@@ -1001,6 +1103,12 @@ def _render_markdown_summary(report: EvaluationReport) -> str:
         f"- Feature schema version: {report.feature_schema_version}",
         f"- Assumptions hash: `{report.assumptions_hash}`",
         f"- Model versions: `{json.dumps(report.model_versions, sort_keys=True)}`",
+        "",
+        "## Δtime Definition",
+        "",
+        f"- Formula: `{DELTA_TIME_FORMULA}`",
+        f"- Interpretation: {DELTA_TIME_DEFINITION_LABEL}",
+        "- Units: milliseconds (`ms`)",
         "",
         "## Layer 1 Behavioral",
         "",

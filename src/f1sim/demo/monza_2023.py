@@ -9,6 +9,7 @@ from pathlib import Path
 
 from f1sim.assumptions import default_assumptions_hash
 from f1sim.ground_truth import attach_ground_truth_to_bundle, extract_lap_actions, load_team_calls
+from f1sim.metrics import DELTA_TIME_DEFINITION_LABEL, DELTA_TIME_FORMULA
 from f1sim.replaydb import load_session_rows, replay_session
 from f1sim.strategy import (
     RolloutSearchConfig,
@@ -76,6 +77,11 @@ def main() -> None:
         "horizon_laps": args.horizon,
         "n_scenarios": args.n_scenarios,
         "two_dry_deadline_laps": args.deadline_laps,
+        "delta_time": {
+            "formula": DELTA_TIME_FORMULA,
+            "interpretation": DELTA_TIME_DEFINITION_LABEL,
+            "units": "ms",
+        },
         "assumptions_hash": default_assumptions_hash(),
         "model_versions": suite.model_versions(),
     }
