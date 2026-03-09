@@ -2,6 +2,18 @@
 
 `f1sim` is a replay-first Formula 1 race strategy simulator. The current MVP can ingest historical sessions into SQLite, replay lap-end race state, evaluate baseline models, and produce deterministic top-K rollout recommendations with structured explanations.
 
+## Latest Version
+
+Current version: `v0.8`
+
+### What's new in v0.8
+- Improved recommendation stability and reduced pathological default actions.
+- Fixed backward compatibility for older SQLite databases without `team_calls`.
+- Corrected actual-action reconstruction logic for replay evaluation.
+- Tightened offline evaluation consistency between recommended action and historical action labels.
+
+See `CHANGELOG.md` for full details.
+
 ## Scope
 
 This repository is currently limited to **historical replay only**. The intended engine consumes lap-end timing, events, and weather snapshots from public data sources, maintains a canonical `RaceState`, and will later produce top-K strategy recommendations with explanations.
